@@ -1,29 +1,51 @@
 #!/usr/bin/env python3
-"""codeindex: token-free code navigation index for a git repo. build | where | callers | tests | map | find.
-  codeindex build            index the repo (Python via ast, JS via regex); also writes CODEMAP.md at the repo root
-  codeindex where NAME       definition of a symbol (NAME or Class.method): file:line
-  codeindex find WORD        symbols whose name contains WORD
-  codeindex callers NAME     call sites of NAME
-  codeindex tests PATH       tests that import or mention a source file (direct, plus one import hop)
-  codeindex map [PREFIX]     the CODEMAP lines for files under PREFIX
-The index lives in <repo>/.index/ (add it to .gitignore). $CODEINDEX_ROOT overrides the repo root; inside a linked
-worktree without its own index the main checkout's index is used. Optional tests/AREAS.toml maps source globs to tests.
-If the graphify tool is on PATH a code graph is refreshed after a build (CODEINDEX_NO_GRAPH=1 skips it, CODEINDEX_WAIT=1
-blocks until it is done)."""
-import ast, os, re, subprocess, sys, tomllib, fnmatch, shutil, time
+"""codeindex: token-free code navigation index for a git repo (standard library only).
+  codeindex build [--full]            index the repo; only files whose git blob hash changed are re-parsed. Also writes
+                                      CODEMAP.md at the repo root. --full ignores the previous index.
+  codeindex where NAME                definitions: name, Class.method, pkg.mod.func, file.ts#func, config key, env var
+  codeindex find WORD                 symbols whose name contains WORD (case-insensitive)
+  codeindex callers NAME [--resolved] [--limit N]
+                                      call sites; each row is `resolved` (target known) or `name-only` (same name only)
+  codeindex tests PATH|NAME           tests that import or mention a source file (direct, plus one import hop)
+  codeindex map [PREFIX]              the CODEMAP lines for files under PREFIX
+  codeindex changed SHA               symbols added, removed or changed between SHA and the working tree
+  codeindex dead [--limit N]          Python symbols with no references outside tests and their own body, largest first
+  codeindex context NAME|PATH [--budget 4000]
+                                      one pack within the character budget: definition, docstring, body, callers,
+                                      callees, tests, last 3 commits
+  codeindex impact NAME|PATH [--depth 3]
+                                      transitive callers, the tests to run (a pytest command), env and config keys read
+  codeindex mcp                       MCP server on stdio (tools: where find callers tests map context impact)
+Python is parsed with ast; JavaScript/TypeScript with a comment/string stripper plus regexes; TOML and JSON keys and
+os.environ / os.getenv / process.env reads are indexed too. The index lives in <repo>/.index/ (add it to .gitignore).
+$CODEINDEX_ROOT overrides the repo root; inside a linked worktree without its own index the main checkout's index is
+used. Optional tests/AREAS.toml maps source globs to tests. If the graphify tool is on PATH a code graph is refreshed
+after a build (CODEINDEX_NO_GRAPH=1 skips it, CODEINDEX_WAIT=1 blocks until it is done)."""
+import ast, bisect, builtins, fnmatch, hashlib, json, os, re, shutil, subprocess, sys, time, tomllib
 from collections import defaultdict
+
+FORMAT = 2          # bump whenever parse output or the index layout changes: the next build is then a full rebuild
+VERSION = "2.0"
+LANGS = ("py", "js", "toml", "json")
+JS_EXT = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+MAX_BYTES = 2_000_000
+CODE_KINDS = ("def", "method", "class", "function")
+sys.setrecursionlimit(20000)
 
 def root():
     r = os.environ.get("CODEINDEX_ROOT")
-    if r: return r
+    if r: return os.path.abspath(r)
+    # Claude Code starts MCP servers with CLAUDE_PROJECT_DIR set to the project root; the working directory is unspecified.
+    cwd = os.environ.get("CLAUDE_PROJECT_DIR") if sys.argv[1:2] == ["mcp"] else None
+    if cwd and not os.path.isdir(cwd): cwd = None
     try:
-        top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL).strip()
+        top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL, cwd=cwd).strip()
     except Exception:
-        return os.getcwd()
+        return cwd or os.getcwd()
     if not os.path.isdir(os.path.join(top, ".index")):
         # Linked worktree: fall back to the main checkout's index.
         try:
-            common = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, stderr=subprocess.DEVNULL).strip()
+            common = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, stderr=subprocess.DEVNULL, cwd=cwd).strip()
             main = os.path.dirname(common)
             if os.path.isdir(os.path.join(main, ".index")):
                 return main
@@ -33,157 +55,1107 @@ def root():
 
 R = root(); IDX = os.path.join(R, ".index")
 
-def files():
-    out = subprocess.check_output(["git", "-C", R, "ls-files", "-co", "--exclude-standard"], text=True)
-    return [f for f in out.splitlines() if os.path.exists(os.path.join(R, f))]
+class NoIndex(Exception): pass
+
+def git(*a, check=True):
+    p = subprocess.run(["git", "-C", R, *a], capture_output=True, encoding="utf-8", errors="replace")
+    if check and p.returncode: raise subprocess.CalledProcessError(p.returncode, a, p.stdout, p.stderr)
+    return p.stdout
+
+def ipath(n): return os.path.join(IDX, n)
+
+def write(n, text):
+    tmp = ipath(n + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh: fh.write(text)
+    os.replace(tmp, ipath(n))
+
+def jload(n):
+    try:
+        with open(ipath(n), encoding="utf-8") as fh: return json.load(fh)
+    except (OSError, ValueError): return None
+
+def read_text(f):
+    with open(os.path.join(R, f), encoding="utf-8", errors="replace") as fh: return fh.read()
+
+def flat(s): return s.replace("\t", " ").replace("\n", " ").replace("\r", " ") if s else ""
 
 def doc1(d):
     if not d: return ""
     for ln in d.strip().splitlines():
-        if ln.strip(): return ln.strip()[:110]
+        if ln.strip(): return flat(ln.strip())[:110]
     return ""
 
-JS_FN = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function|[A-Za-z_$][\w$]*\s*=>)")
+def is_test(f):
+    parts = f.split("/"); b = parts[-1]
+    return (any(p in ("tests", "test", "__tests__") for p in parts[:-1]) or b.startswith("test_") or b == "conftest.py"
+            or b.endswith("_test.py") or re.search(r"\.(test|spec)\.[cm]?[jt]sx?$", b) is not None)
 
-def parse_file(f, p):
-    sym, calls, imps = [], [], set()
-    if f.endswith(".py"):
-        try:
-            src = open(p, encoding="utf-8", errors="replace").read()
-            tree = ast.parse(src)
-        except Exception:
-            return [], [], set(), ("", [], 0)
-        top = []
-        for n in ast.walk(tree):
-            if isinstance(n, ast.Import):
-                for a in n.names: imps.add(a.name)
-            elif isinstance(n, ast.ImportFrom):
-                if n.level:
-                    pk = f.split("/")[:-1]
-                    pk = pk[:len(pk) - (n.level - 1)] if n.level > 1 else pk
-                    m = ".".join(pk + ([n.module] if n.module else []))
-                else: m = n.module or ""
-                imps.add(m)
-                for a in n.names: imps.add(m + "." + a.name)
-        def visit(node, scope):
-            for c in ast.iter_child_nodes(node):
-                if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    kind = "class" if isinstance(c, ast.ClassDef) else "def"
-                    q = (scope + "." if scope else "") + c.name
-                    sym.append((c.name, q, kind, f, c.lineno, doc1(ast.get_docstring(c))))
-                    if not scope: top.append(c.name)
-                    visit(c, q)
-                else:
-                    if isinstance(c, ast.Call):
-                        fn = c.func
-                        nm = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
-                        if nm: calls.append((nm, f, c.lineno, scope or "<module>"))
-                    visit(c, scope)
-        visit(tree, "")
-        return sym, calls, imps, (doc1(ast.get_docstring(tree)), top, len(src.splitlines()))
-    if f.endswith((".js", ".mjs")) and "vendor" not in f and ".min." not in f:
-        try: lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
-        except Exception: return [], [], set(), None
-        top = []
-        for i, ln in enumerate(lines, 1):
-            m = JS_FN.match(ln)
-            if m:
-                nm = m.group(1) or m.group(2); sym.append((nm, nm, "js", f, i, "")); top.append(nm)
-        return sym, calls, imps, ("", top, len(lines))
-    return [], [], set(), None
+# ---------------------------------------------------------------- file table: path -> (git blob sha, language)
 
-def build():
-    t0 = time.time()
-    fl = files()
-    sym, calls, imps, mods = [], [], defaultdict(set), {}
-    import pickle, hashlib
-    cp = os.path.join(IDX, "cache.pkl")
-    try: cache = pickle.load(open(cp, "rb"))
-    except Exception: cache = {}
-    ncache = {}; redone = 0
-    for f in fl:
-        p = os.path.join(R, f)
-        try: st = os.stat(p); key = (st.st_mtime_ns, st.st_size)
-        except OSError: continue
-        ent = cache.get(f)
-        if ent and ent[0] == key:
-            ncache[f] = ent
-            _, fsym, fcalls, fimps, fmod = ent
-        else:
-            redone += 1
-            fsym, fcalls, fimps, fmod = parse_file(f, p)
-            ncache[f] = (key, fsym, fcalls, fimps, fmod)
-        sym += fsym; calls += fcalls
-        if fimps: imps[f] |= fimps
-        if fmod is not None: mods[f] = fmod
+def lang_of(f):
+    parts = f.split("/"); b = parts[-1]
+    if parts[0] in (".index", ".git") or "node_modules" in parts: return None
+    if b.endswith(".py"): return "py"
+    if b.endswith(JS_EXT): return None if ".min." in b or "vendor" in parts else "js"
+    if b.endswith(".toml"): return "toml"
+    if b.endswith(".json"):
+        return None if b.endswith(("-lock.json", ".lock.json")) or ".min." in b or "vendor" in parts else "json"
+    return "?" if "." not in b else None          # extensionless: decided by its #! line
+
+def peek(p):
     try:
-        os.makedirs(IDX, exist_ok=True); pickle.dump(ncache, open(cp, "wb"))
-    except Exception: pass
-    # tests map
-    tests = [f for f in mods if f.startswith("tests/") and f.endswith(".py")]
-    srcs = [f for f in mods if not f.startswith("tests/") and f.endswith(".py")]
-    def dotted(f):
-        d = f[:-3].replace("/", ".")
-        return d[:-9] if d.endswith(".__init__") else d
+        with open(p, "rb") as fh: head = fh.readline(200)
+    except OSError: return "-"
+    if head.startswith(b"#!"):
+        if b"python" in head: return "py"
+        if b"node" in head: return "js"
+    return "-"
+
+def blob_sha(p):
+    with open(p, "rb") as fh: d = fh.read()
+    return hashlib.sha1(b"blob %d\0" % len(d) + d).hexdigest()
+
+def scan(old):
+    """{path: (sha, lang)} for the work tree. Clean tracked files take their blob sha from the git index (no reads);
+    modified and untracked ones are hashed the way git would hash them."""
+    try:
+        staged = git("ls-files", "-s", "-z").split("\0")
+        dirty = git("ls-files", "-m", "-z").split("\0")
+        other = git("ls-files", "-o", "--exclude-standard", "-z").split("\0")
+    except (OSError, subprocess.CalledProcessError):
+        cand = {}
+        for d, ds, fs in os.walk(R):
+            ds[:] = [x for x in ds if not x.startswith(".") and x != "node_modules"]
+            for x in fs: cand[os.path.relpath(os.path.join(d, x), R).replace(os.sep, "/")] = None
+        return hash_files(cand, old)
+    cand = {}
+    for ent in staged:
+        if not ent: continue
+        meta, f = ent.split("\t", 1)
+        mode, sha, stage = meta.split(" ")
+        if mode in ("100644", "100755"): cand[f] = sha if stage == "0" else None
+    for f in dirty:
+        if f in cand: cand[f] = None
+    for f in other:
+        if f: cand[f] = None
+    return hash_files(cand, old)
+
+def hash_files(cand, old):
+    out = {}
+    for f, sha in cand.items():
+        lang = lang_of(f)
+        if lang is None: continue
+        p = os.path.join(R, f)
+        if sha is None:
+            try:
+                if os.path.getsize(p) > MAX_BYTES: continue
+                sha = blob_sha(p)
+            except OSError: continue                 # deleted in the work tree
+        if lang == "?":
+            o = old.get(f)
+            lang = o[1] if o and o[0] == sha else peek(p)
+        out[f] = (sha, lang)
+    return out
+
+def read_hashes():
+    out = {}
+    try:
+        with open(ipath("hashes.tsv"), encoding="utf-8") as fh:
+            for ln in fh:
+                f, sha, lang = ln.rstrip("\n").split("\t")
+                out[f] = (sha, lang)
+    except (OSError, ValueError): return {}
+    return out
+
+# ---------------------------------------------------------------- shared parse helpers
+
+def seg_hashes(lines, spans):
+    """Hash each [start, end, parent] span's own lines: a parent's hash leaves out its children, so editing one
+    method marks that method changed, not its class. Position is not hashed, so moving code is not a change."""
+    kids = defaultdict(list)
+    for i, (s, e, p) in enumerate(spans):
+        if p >= 0: kids[p].append((s, e))
+    out = []
+    for i, (s, e, p) in enumerate(spans):
+        skip = set()
+        for a, b in kids[i]: skip.update(range(a, b + 1))
+        txt = "\n".join(lines[j - 1].rstrip() for j in range(s, min(e, len(lines)) + 1) if j not in skip)
+        out.append(hashlib.md5(txt.encode("utf-8", "replace")).hexdigest()[:12])
+    return out
+
+def vhash(v): return hashlib.md5(str(v).encode("utf-8", "replace")).hexdigest()[:12]
+
+STRLIKE = re.compile(r"[A-Za-z_][\w.:/-]{0,119}\Z")
+ENTRY = re.compile(r"[A-Za-z_][\w.]*[:.]([A-Za-z_]\w*)\Z")   # "pkg.cli:main" or "pkg.plugins.Foo" in config values
+
+def empty(lang, loc=0): return {"l": lang, "loc": loc, "doc": "", "top": [], "s": [], "c": [], "e": []}
+
+# ---------------------------------------------------------------- Python
+# A call target ("raw") is recorded relative to the file, so a cached parse stays valid when other files change:
+#   "pkg.mod.f"  absolute dotted name     "@0:Cls.m"  this module      "@2:sub.f"  `from ..sub import f`
+#   "SUPER:@0:Cls|m"  super().m() in Cls  "STAR:name"  maybe from a `from x import *`
+# Bindings may also be "SELF:@0:Cls" (self/cls in a method) or "INST:<raw>" (x = SomeClass(...)).
+
+BUILTIN_NAMES = frozenset(dir(builtins))
+ENV_FUNCS = {"os.getenv", "os.environ.get", "os.environ.setdefault", "os.environ.pop", "os.getenvb"}
+TRY_STAR = getattr(ast, "TryStar", ast.Try)
+
+def unparse(n):
+    try: return flat(ast.unparse(n))
+    except Exception: return "?"
+
+def deco_name(d): return unparse(d.func if isinstance(d, ast.Call) else d)
+
+def rjoin(b, rest): return b + rest if b.endswith(":") else b + "." + rest
+
+class PyIndexer:
+    def __init__(s, lines):
+        s.lines = lines
+        s.syms, s.spans, s.calls, s.env = [], [], [], []
+        s.refs, s.strs = defaultdict(set), defaultdict(set)
+        s.binds, s.stars, s.imps, s.bases, s.vars = {}, [], set(), {}, set()
+        s.frames = [["mod", "", s.binds, -1]]             # [kind mod|cls|fn, qualname, bindings, symbol index]
+
+    def lookup(s, name):
+        fr = s.frames
+        for i in range(len(fr) - 1, -1, -1):
+            if fr[i][0] == "cls" and i != len(fr) - 1: continue   # class scope is not visible inside methods
+            if name in fr[i][2]: return fr[i][2][name]
+        if name in BUILTIN_NAMES: return "builtins." + name
+        return "STAR:" + name if s.stars else None
+
+    def chain(s, e):
+        parts = []
+        while type(e) is ast.Attribute: parts.append(e.attr); e = e.value
+        if type(e) is not ast.Name: return None
+        b = s.lookup(e.id)
+        if b is None or not parts: return b
+        parts.reverse()
+        if b.startswith("SELF:"): return b[5:] + "." + parts[0] if len(parts) == 1 else None
+        if b.startswith("INST:"): b = b[5:]
+        return rjoin(b, ".".join(parts))
+
+    def valraw(s, v):
+        t = type(v)
+        if t is ast.Name or t is ast.Attribute: return s.chain(v)
+        if t is ast.Call:
+            r = s.chain(v.func)
+            if r and not r.startswith(("SELF:", "INST:", "STAR:", "builtins.")): return "INST:" + r
+        return None
+
+    def bind_import(s, n, binds):
+        if type(n) is ast.Import:
+            for a in n.names:
+                s.imps.add(a.name)
+                if a.asname: binds[a.asname] = a.name
+                else: top = a.name.split(".")[0]; binds[top] = top
+            return
+        base = f"@{n.level}:{n.module or ''}" if n.level else (n.module or "")
+        s.imps.add(base)
+        for a in n.names:
+            if a.name == "*": s.stars.append(base); continue
+            t = rjoin(base, a.name); s.imps.add(t); binds[a.asname or a.name] = t
+            s.refs[a.name].add(s.frames[-1][1])           # importing a name keeps it alive (re-exports)
+
+    def modstmts(s, body):
+        for n in body:
+            yield n
+            if type(n) in (ast.If, ast.Try, TRY_STAR, ast.With, ast.For, ast.While):
+                for k in ("body", "orelse", "finalbody"): yield from s.modstmts(getattr(n, k, []))
+                for h in getattr(n, "handlers", []): yield from s.modstmts(h.body)
+
+    def prepass(s, body):
+        # Module-level names are all visible inside functions, whatever their order in the file.
+        st = list(s.modstmts(body))
+        for n in st:
+            t = type(n)
+            if t is ast.Import or t is ast.ImportFrom: s.bind_import(n, s.binds)
+            elif t in (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef): s.binds[n.name] = "@0:" + n.name
+        for n in st:
+            if type(n) in (ast.Assign, ast.AnnAssign) and n.value is not None:
+                v = s.valraw(n.value)
+                if v is not None:
+                    for t in (n.targets if type(n) is ast.Assign else [n.target]):
+                        if type(t) is ast.Name: s.binds[t.id] = v
+
+    def visit(s, n):
+        h = PY_HANDLERS.get(type(n))
+        if h: return h(s, n)
+        for c in ast.iter_child_nodes(n): s.visit(c)
+
+    def kids(s, n):
+        for c in ast.iter_child_nodes(n): s.visit(c)
+
+    def add(s, n, kind, q, sig, decos):
+        start = min([d.lineno for d in n.decorator_list] + [n.lineno])
+        end = n.end_lineno or n.lineno
+        s.syms.append([n.name, kind, n.lineno, end, q, flat(sig)[:200], doc1(ast.get_docstring(n)), "", " ".join(decos)])
+        s.spans.append([start, end, s.frames[-1][3]])
+        return len(s.syms) - 1
+
+    def func(s, n):
+        for d in n.decorator_list: s.visit(d)
+        a = n.args
+        for d in a.defaults + [d for d in a.kw_defaults if d]: s.visit(d)
+        params = a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x]
+        for x in params:
+            if x.annotation: s.visit(x.annotation)
+        if n.returns: s.visit(n.returns)
+        par = s.frames[-1]
+        q = par[1] + "." + n.name if par[1] else n.name
+        kind = "method" if par[0] == "cls" else "def"
+        sig = ("async " if type(n) is ast.AsyncFunctionDef else "") + "(" + unparse(a) + ")" + (" -> " + unparse(n.returns) if n.returns else "")
+        decos = [deco_name(d) for d in n.decorator_list]
+        idx = s.add(n, kind, q, sig, decos)
+        if par[0] != "mod": par[2][n.name] = "@0:" + q
+        b = {x.arg: None for x in params}
+        pos = a.posonlyargs + a.args
+        if kind == "method" and pos and "staticmethod" not in decos: b[pos[0].arg] = "SELF:@0:" + par[1]
+        s.frames.append(["fn", q, b, idx])
+        for c in n.body: s.visit(c)
+        s.frames.pop()
+
+    def cls(s, n):
+        for d in n.decorator_list: s.visit(d)
+        for b in n.bases: s.visit(b)
+        for k in n.keywords: s.visit(k.value)
+        par = s.frames[-1]
+        q = par[1] + "." + n.name if par[1] else n.name
+        bs = []
+        for b in n.bases:
+            r = s.chain(b)
+            bs.append(r if r and not r.startswith(("SELF:", "INST:")) else "")
+        s.bases[q] = bs
+        sig = "(" + ", ".join(unparse(x) for x in n.bases + n.keywords) + ")" if n.bases or n.keywords else ""
+        idx = s.add(n, "class", q, sig, [deco_name(d) for d in n.decorator_list])
+        if par[0] != "mod": par[2][n.name] = "@0:" + q
+        s.frames.append(["cls", q, {}, idx])
+        for c in n.body: s.visit(c)
+        s.frames.pop()
+
+    def assign(s, n):
+        if n.value is not None: s.visit(n.value)
+        if type(n) is ast.AnnAssign: s.visit(n.annotation); targets = [n.target]
+        else: targets = n.targets
+        fr = s.frames[-1]
+        val = s.valraw(n.value) if n.value is not None else None
+        for t in targets:
+            if type(t) is ast.Name:
+                if fr[0] == "fn": fr[2][t.id] = val
+                elif fr[0] == "mod" and t.id not in s.vars:
+                    s.vars.add(t.id)
+                    s.syms.append([t.id, "var", n.lineno, n.end_lineno or n.lineno, t.id, "", "", "", ""])
+                    s.spans.append([n.lineno, n.end_lineno or n.lineno, -1])
+            else: s.visit(t)
+
+    def name(s, n):
+        if type(n.ctx) is ast.Load: s.refs[n.id].add(s.frames[-1][1])
+        elif s.frames[-1][0] == "fn": s.frames[-1][2][n.id] = None   # loop/with/except targets shadow outer names
+
+    def attr(s, n):
+        s.refs[n.attr].add(s.frames[-1][1]); s.visit(n.value)
+
+    def const(s, n):
+        if type(n.value) is str and STRLIKE.match(n.value): s.strs[n.value].add(s.frames[-1][1])
+
+    def imp(s, n):
+        if len(s.frames) > 1: s.bind_import(n, s.frames[-1][2])   # module level was bound in the prepass
+
+    def method_class(s):
+        fr = s.frames
+        for i in range(len(fr) - 1, 0, -1):
+            if fr[i][0] == "fn" and fr[i - 1][0] == "cls": return fr[i - 1][1]
+        return None
+
+    def call(s, n):
+        f = n.func; t = type(f); raw = None
+        if t is ast.Name: name = f.id
+        elif t is ast.Attribute: name = f.attr
+        else: return s.kids(n)
+        v = f.value if t is ast.Attribute else None
+        if type(v) is ast.Call and type(v.func) is ast.Name and v.func.id == "super":
+            c = s.method_class()
+            if c: raw = "SUPER:@0:" + c + "|" + name
+        else:
+            raw = s.chain(f)
+            if raw and raw.startswith(("SELF:", "INST:")): raw = None
+        s.calls.append([name, n.lineno, s.frames[-1][1], raw or ""])
+        if raw in ENV_FUNCS and n.args and type(n.args[0]) is ast.Constant and type(n.args[0].value) is str:
+            s.env.append([flat(n.args[0].value), n.lineno, s.frames[-1][1]])
+        s.kids(n)
+
+    def sub(s, n):
+        sl = n.slice
+        if type(n.ctx) is ast.Load and type(sl) is ast.Constant and type(sl.value) is str and s.chain(n.value) == "os.environ":
+            s.env.append([flat(sl.value), n.lineno, s.frames[-1][1]])
+        s.kids(n)
+
+    def cmp(s, n):
+        if (type(n.left) is ast.Constant and type(n.left.value) is str and any(type(o) in (ast.In, ast.NotIn) for o in n.ops)
+                and any(s.chain(c) == "os.environ" for c in n.comparators)):
+            s.env.append([flat(n.left.value), n.lineno, s.frames[-1][1]])
+        s.kids(n)
+
+PY_HANDLERS = {ast.FunctionDef: PyIndexer.func, ast.AsyncFunctionDef: PyIndexer.func, ast.ClassDef: PyIndexer.cls,
+               ast.Assign: PyIndexer.assign, ast.AnnAssign: PyIndexer.assign, ast.Name: PyIndexer.name,
+               ast.Attribute: PyIndexer.attr, ast.Constant: PyIndexer.const, ast.Import: PyIndexer.imp,
+               ast.ImportFrom: PyIndexer.imp, ast.Call: PyIndexer.call, ast.Subscript: PyIndexer.sub, ast.Compare: PyIndexer.cmp}
+
+def parse_py(src):
+    lines = src.splitlines()
+    try:
+        tree = ast.parse(src)
+        P = PyIndexer(lines); P.prepass(tree.body)
+        for n in tree.body: P.visit(n)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return empty("py", len(lines))
+    for sym, h in zip(P.syms, seg_hashes(lines, P.spans)): sym[7] = h
+    return {"l": "py", "loc": len(lines), "doc": doc1(ast.get_docstring(tree)),
+            "top": [x[0] for x in P.syms if x[1] in ("def", "class") and "." not in x[4]],
+            "s": P.syms, "c": P.calls, "e": P.env, "r": {k: sorted(v) for k, v in P.refs.items()},
+            "t": {k: sorted(v) for k, v in P.strs.items()}, "b": P.binds, "st": P.stars, "i": sorted(P.imps), "cb": P.bases}
+
+# ---------------------------------------------------------------- JavaScript / TypeScript
+# 1. js_clean blanks comments and replaces every string, template and regex literal with a placeholder ('N' is
+#    strings[N]; regexes become 0), keeping newlines, so braces and parentheses that remain are real code.
+# 2. One event regex walks the cleaned text; a brace stack gives scopes (function, class, object literal, type body).
+
+JS_CLEAN = re.compile(r"""(?P<c>//[^\n]*+|/\*.*?\*/)|(?P<s>'(?:\\.|[^'\\\n])*+'|"(?:\\.|[^"\\\n])*+"|`(?:\\.|\$\{(?:[^{}`]|\{[^{}`]*+\})*+\}|[^\\`$]|\$(?!\{))*+`)|(?:(?<=[(,=:\[!&|?{};])|(?<=\breturn))(?P<w>\s*)(?P<r>/(?![*/])(?:\\.|\[(?:\\.|[^\]\\\n])*+\]|[^/\\\n\[])++/[A-Za-z]*)""", re.S)
+JS_EV = re.compile(r"""
+ (?P<ob>\{) | (?P<cb>\}) | (?P<str>'(?P<sn>\d+)')
+|(?<![\w$.])(?P<fn>function)\b\s*\*?\s*(?P<fnn>ID)?
+|(?<![\w$.])class\s+(?P<cls>ID)(?:\s*<[^{]*?>)?(?:\s+extends\s+(?P<ext>ID(?:\.ID)*))?
+|(?<![\w$.])(?P<tsk>interface|enum)\s+(?P<tsn>ID)
+|(?<![\w$.])type\s+(?P<tan>ID)\s*(?:<[^=;]*?>)?\s*=(?!=)
+|(?<![\w$.])(?:const|let|var)\s+(?P<vn>ID)\s*(?::[^=;{}()]{1,120}?)?=(?![=>])\s*(?P<vfn>(?:async\s+)?function\b|(?:async\s*)?(?:\(PARAMS\)|ID)\s*(?::[^=;{}()]{1,120}?)?=>)?
+|(?<![\w$.])(?:(?:module\.)?exports\.(?P<cjn>ID)|(?P<pc>ID)\.prototype\.(?P<pm>ID))\s*=(?![=>])\s*(?P<cfn>(?:async\s+)?function\b|(?:async\s*)?(?:\(PARAMS\)|ID)\s*=>)?
+|(?m:^)[ \t]*(?:(?:public|private|protected|static|readonly|override|declare)\s+)*(?P<fld>[#]?ID)\s*(?::[^=;{}()]{1,120}?)?=(?![=>])\s*(?:async\s*)?(?:\(PARAMS\)|ID)\s*(?::[^=;{}()]{1,120}?)?=>
+|(?<![\w$.])(?P<env>(?:process|import\.meta)\.env\b(?:\s*\.\s*(?P<ev>ID)|\s*\[\s*'(?P<evn>\d+)'\s*\])?)
+|(?<![\w$\#])(?P<ch>[#]?ID(?:\s*\??\.\s*[#]?ID)*)\s*(?:<[\w$.,\s\[\]|&]*>)?\s*(?:\?\.)?\(
+""".replace("PARAMS", r"[^()]*+(?:\([^()]*+\)[^()]*+)*+").replace("ID", r"[A-Za-z_$][\w$]*"), re.X)
+JS_PAREN_OPEN = re.compile(r"\s*\*?\s*(?:[A-Za-z_$][\w$]*)?\s*(?:<[^<>()]*(?:<[^<>()]*>[^<>()]*)*>)?\s*\(")
+JS_BODY = re.compile(r"\s*(?::[^{};]{0,200}?)?\{")
+JS_BRACE = re.compile(r"\s*\{")
+JS_PARENS = re.compile(r"[()]")
+JS_METHOD_START = re.compile(r"[{};\n)]\s*(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set|declare|accessor)\s+|\*\s*)*\Z")
+JS_OBJ_START = re.compile(r"[{,\n]\s*(?:(?:async|get|set)\s+|\*\s*)*\Z")
+JS_DESTR = re.compile(r"\{([^{}]*)\}\s*=\s*\Z")
+JS_KW = frozenset("if for while switch catch with return typeof function void delete in of do else case throw yield await "
+                  "import super async require new instanceof export default from".split())
+JS_GLOBALS = frozenset("console Math JSON Object Array Promise String Number Boolean Date Symbol Map Set WeakMap WeakSet "
+                       "Reflect Proxy Error TypeError RegExp Intl BigInt window document globalThis process Buffer navigator "
+                       "setTimeout setInterval clearTimeout clearInterval fetch parseInt parseFloat isNaN encodeURIComponent "
+                       "decodeURIComponent structuredClone queueMicrotask URL URLSearchParams".split())
+JS_IMPORT = re.compile(r"(?<![\w$.])import\s+(?:type\s+)?([\w$*{},\s]+?)\s*from\s*'(\d+)'")
+JS_IMPORT_BARE = re.compile(r"(?<![\w$.])import\s*(?:\(\s*)?'(\d+)'")
+JS_REEXPORT = re.compile(r"(?<![\w$.])export\s+(?:type\s+)?(\*(?:\s*as\s+[\w$]+)?|\{[^{}]*\})\s*from\s*'(\d+)'")
+JS_REQUIRE = re.compile(r"(?<![\w$.])(?:(?:const|let|var)\s+([\w$]+|\{[^{}]*\})\s*=\s*)?require\s*\(\s*'(\d+)'\s*\)(\s*\.\s*[\w$]+)?")
+JS_EXPORT_DECL = re.compile(r"(?<![\w$.])export\s+(?:declare\s+)?(default\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\s*\*?|class|const|let|var|interface|type|enum|namespace)?\s*([\w$]+)")
+JS_EXPORT_LIST = re.compile(r"(?<![\w$.])export\s+(?:type\s+)?\{([^{}]*)\}(?!\s*from)")
+JS_MODEXP = re.compile(r"(?<![\w$.])module\.exports\s*=\s*(?:(\{)|([\w$]+))")
+JS_EXPDOT = re.compile(r"(?<![\w$.])(?:module\.)?exports\.([\w$]+)\s*=(?![=>])\s*([\w$]+)?")
+
+def js_clean(src):
+    strs = []
+    def rep(m):
+        g = m.lastgroup; t = m.group()
+        if g == "c": return "\n" * t.count("\n") or " "
+        if g == "s":
+            strs.append(t[1:-1] if len(t) < 300 else "")
+            return "'%d'" % (len(strs) - 1) + "\n" * t.count("\n")
+        return m.group("w") + "0"
+    return JS_CLEAN.sub(rep, src), strs
+
+def close_paren(c, i):
+    d = 0
+    for m in JS_PARENS.finditer(c, i, i + 20000):
+        if c[m.start()] == "(": d += 1
+        else:
+            d -= 1
+            if not d: return m.start()
+    return -1
+
+def js_body(c, i):
+    """Position of the body '{' of a function whose parameter list starts at or after i, else None."""
+    m = JS_PAREN_OPEN.match(c, i)
+    if not m: return None
+    cp = close_paren(c, m.end() - 1)
+    b = JS_BODY.match(c, cp + 1) if cp >= 0 else None
+    return b.end() - 1 if b else None
+
+def js_sig(lines, ln, name):
+    t = lines[ln - 1] if 0 < ln <= len(lines) else ""
+    i = t.find(name); j = t.find("(", i + len(name)) if i >= 0 else -1
+    if j < 0: return ""
+    d = 0
+    for k in range(j, len(t)):
+        if t[k] == "(": d += 1
+        elif t[k] == ")":
+            d -= 1
+            if not d: return flat(t[j:k + 1])[:200]
+    return flat(t[j:].strip())[:196] + " ..."
+
+def js_doc(lines, ln):
+    i = ln - 2
+    while i >= 0 and lines[i].strip().startswith("@"): i -= 1
+    if i < 0 or not lines[i].rstrip().endswith("*/"): return ""
+    j = i
+    while j >= 0 and i - j < 60 and "/**" not in lines[j]: j -= 1
+    if j < 0 or "/**" not in lines[j]: return ""
+    body = [re.sub(r"^\s*(/\*\*|\*/|\*)?", "", x).replace("*/", "").strip() for x in lines[j:i + 1]]
+    return doc1("\n".join(x for x in body if not x.startswith("@")))
+
+def js_names(what):
+    """`X, {a, b as c}` / `* as ns` -> [(local, imported)], imported being a name, 'default' or '*'."""
+    out, w = [], what
+    br = re.search(r"\{([^}]*)\}", w)
+    if br:
+        for part in br.group(1).split(","):
+            part = re.sub(r"^\s*type\s+", "", part).strip()
+            if not part: continue
+            a, _, b = part.partition(" as ")
+            out.append(((b or a).strip(), a.strip()))
+        w = w[:br.start()] + w[br.end():]
+    ns = re.search(r"\*\s*as\s+([\w$]+)", w)
+    if ns: out.append((ns.group(1), "*")); w = w[:ns.start()] + w[ns.end():]
+    out += [(d, "default") for d in re.findall(r"[\w$]+", w) if d != "type"]
+    return out
+
+def js_obj_members(txt):
+    parts, d, cur = [], 0, []
+    for ch in txt[:20000]:
+        if ch in "([{": d += 1
+        elif ch in ")]}": d -= 1
+        if ch == "," and d == 0: parts.append("".join(cur)); cur = []
+        else: cur.append(ch)
+    parts.append("".join(cur))
+    out = {}
+    for p in parts:
+        m = re.match(r"\s*(?:(?:async|get|set)\s+|\*\s*)*([\w$]+)\s*(?::\s*([\w$]+)\s*$)?", p)
+        if m and not p.strip().startswith("..."): out[m.group(1)] = m.group(2) or m.group(1)
+    return out
+
+def parse_js(src):
+    c, strs = js_clean(src)
+    lines = src.splitlines()
+    S = lambda i: strs[int(i)] if int(i) < len(strs) else ""
+    syms, parents, calls, env, sref = [], [], [], [], defaultdict(set)
+    stack, pend, tops = [], {}, []         # stack entries: [kind def|cls|obj|skip|blk, qualname, symbol index]
+    line, last = 1, 0
+
+    def find(kinds):
+        for e in reversed(stack):
+            if e[0] in kinds: return e
+        return None
+    def prefix():
+        e = find(("def", "cls", "obj")); return e[1] + "." if e else ""
+    def scope():
+        e = find(("def", "cls")); return e[1] if e else ""
+    def add(nm, kind, q, ln, sig=None):
+        parents.append(next((e[2] for e in reversed(stack) if e[2] >= 0), -1))
+        syms.append([nm, kind, ln, ln, q, js_sig(lines, ln, nm) if sig is None else sig, js_doc(lines, ln), "", ""])
+        if not find(("def", "cls")): tops.append(nm)
+        return len(syms) - 1
+
+    for m in JS_EV.finditer(c):
+        p = m.start(); line += c.count("\n", last, p); last = p
+        top = stack[-1] if stack else None
+        if m.start("ob") >= 0:
+            k = pend.pop(p, None)
+            stack.append(k or ["skip" if top and top[0] == "skip" else "blk", None, -1]); continue
+        if m.start("cb") >= 0:
+            if stack:
+                k = stack.pop()
+                if k[2] >= 0: syms[k[2]][3] = line
+            continue
+        if top and top[0] == "skip": continue
+        if m.start("str") >= 0:
+            s = S(m.group("sn"))
+            if STRLIKE.match(s): sref[s].add(scope())
+        elif m.start("fn") >= 0:
+            nm = m.group("fnn"); b = js_body(c, m.end())
+            if nm and nm not in JS_KW:
+                q = prefix() + nm; idx = add(nm, "function", q, line)
+                if b is not None: pend[b] = ["def", q, idx]
+        elif m.start("cls") >= 0:
+            nm = m.group("cls"); q = prefix() + nm
+            idx = add(nm, "class", q, line, "(extends " + m.group("ext") + ")" if m.group("ext") else "")
+            b = c.find("{", m.end())
+            if b >= 0: pend[b] = ["cls", q, idx]
+        elif m.start("tsk") >= 0 or m.start("tan") >= 0:
+            nm = m.group("tsn") or m.group("tan"); kind = m.group("tsk") or "type"
+            idx = add(nm, kind, prefix() + nm, line, "")
+            b = c.find("{", m.end()) if kind != "type" else (JS_BRACE.match(c, m.end()) or None)
+            if kind == "type": b = b.end() - 1 if b else -1
+            if b >= 0: pend[b] = ["skip", None, idx]
+        elif m.start("vn") >= 0:
+            nm, vfn = m.group("vn"), m.group("vfn")
+            if vfn:
+                q = prefix() + nm; idx = add(nm, "function", q, line)
+                if vfn.rstrip().endswith("function"): b = js_body(c, m.end())
+                else: b = JS_BRACE.match(c, m.end()); b = b.end() - 1 if b else None
+                if b is not None: pend[b] = ["def", q, idx]
+            else:
+                b = JS_BRACE.match(c, m.end())
+                if not find(("def",)): add(nm, "const", prefix() + nm, line, "")
+                if b: pend[b.end() - 1] = ["obj", prefix() + nm, -1]
+        elif m.start("cjn") >= 0 or m.start("pm") >= 0:
+            if m.group("cfn"):
+                nm = m.group("cjn") or m.group("pm")
+                q = nm if m.group("cjn") else m.group("pc") + "." + nm
+                idx = add(nm, "function" if m.group("cjn") else "method", q, line)
+                if m.group("cfn").rstrip().endswith("function"): b = js_body(c, m.end())
+                else: b = JS_BRACE.match(c, m.end()); b = b.end() - 1 if b else None
+                if b is not None: pend[b] = ["def", q, idx]
+        elif m.start("fld") >= 0:
+            if top and top[0] == "cls":
+                nm = m.group("fld"); q = top[1] + "." + nm; idx = add(nm, "method", q, line)
+                b = JS_BRACE.match(c, m.end())
+                if b: pend[b.end() - 1] = ["def", q, idx]
+        elif m.start("env") >= 0:
+            v = m.group("ev") or (S(m.group("evn")) if m.group("evn") else "")
+            if v: env.append([flat(v), line, scope()])
+            else:
+                d = JS_DESTR.search(c, max(0, p - 300), p)
+                for part in (d.group(1).split(",") if d else []):
+                    k = part.split(":")[0].split("=")[0].strip()
+                    if re.fullmatch(r"[A-Za-z_]\w*", k): env.append([k, line, scope()])
+        else:
+            ch = re.sub(r"[\s?]", "", m.group("ch")); parts = ch.split(".")
+            if parts[0] in JS_KW or parts[-1] in JS_KW: continue
+            if len(parts) == 1:
+                s0 = m.start("ch"); lo = max(0, s0 - 80)
+                if top and top[0] == "cls" and JS_METHOD_START.search(c, lo, s0):
+                    q = top[1] + "." + ch; idx = add(ch, "method", q, line)
+                    cp = close_paren(c, m.end() - 1); b = JS_BODY.match(c, cp + 1) if cp >= 0 else None
+                    if b: pend[b.end() - 1] = ["def", q, idx]
+                    continue
+                if JS_OBJ_START.search(c, lo, s0):
+                    cp = close_paren(c, m.end() - 1); b = JS_BODY.match(c, cp + 1) if cp >= 0 else None
+                    if b:                                           # `name(...) {` = object-literal method
+                        q = prefix() + ch; idx = add(ch, "method", q, line)
+                        pend[b.end() - 1] = ["def", q, idx]
+                        continue
+            e = find(("cls",))
+            calls.append([parts[-1], line, scope(), ch, e[1] if e else ""])
+
+    # imports, exports, requires
+    binds, specs, ex, rex, stars = {}, set(), {}, [], []
+    for m in JS_IMPORT.finditer(c):
+        sp = S(m.group(2)); specs.add(sp)
+        for loc, imp in js_names(m.group(1)): binds[loc] = [sp, imp]
+    for m in JS_IMPORT_BARE.finditer(c): specs.add(S(m.group(1)))
+    for m in JS_REEXPORT.finditer(c):
+        sp = S(m.group(2)); specs.add(sp); w = m.group(1)
+        if w.startswith("{"):
+            for a, b in js_names(w): rex.append([sp, b, a])
+        elif "as" in w: rex.append([sp, "*", w.split()[-1]])
+        else: stars.append(sp)
+    for m in JS_REQUIRE.finditer(c):
+        sp = S(m.group(2)); specs.add(sp); v = m.group(1); prop = (m.group(3) or "").replace(".", "").strip()
+        if not v: continue
+        if v.startswith("{"):
+            for part in v[1:-1].split(","):
+                a, _, b = part.partition(":"); a, b = a.strip(), b.strip()
+                if a: binds[b or a] = [sp, a]
+        else: binds[v] = [sp, prop or "*"]
+    for m in JS_EXPORT_DECL.finditer(c):
+        nm = m.group(2)
+        if nm in JS_KW: continue
+        ex["default" if m.group(1) else nm] = nm
+    for m in JS_EXPORT_LIST.finditer(c):
+        for a, b in js_names(m.group(1)): ex[a] = b
+    for m in JS_MODEXP.finditer(c):
+        if m.group(2): ex["default"] = m.group(2)
+        else:
+            b = c.find("{", m.start()); d, k = 0, b
+            for k in range(b, min(len(c), b + 20000)):
+                d += (c[k] == "{") - (c[k] == "}")
+                if not d: break
+            ex.update(js_obj_members(c[b + 1:k]))
+    for m in JS_EXPDOT.finditer(c):
+        v = m.group(2)
+        ex[m.group(1)] = v if v and v not in ("function", "async") and v not in JS_KW else m.group(1)
+
+    quals = {x[4] for x in syms}
+    out = []
+    for name, ln, sc, ch, cq in calls:
+        parts = ch.split("."); a = parts[0]; raw = ""
+        if a == "this":
+            if cq and len(parts) == 2: raw = "L|" + cq + "." + parts[1]
+        elif a in binds:
+            raw = "I|" + binds[a][0] + "|" + binds[a][1] + "|" + ".".join(parts[1:])
+        else:
+            pre = sc.split(".") if sc else []
+            for k in range(len(pre), -1, -1):
+                q = ".".join(pre[:k] + [ch])
+                if q in quals: raw = "L|" + q; break
+            else:
+                if a in JS_GLOBALS: raw = "G|" + ch
+        out.append([name, ln, sc, raw])
+    spans = [[x[2], x[3], parents[i]] for i, x in enumerate(syms)]
+    for sym, h in zip(syms, seg_hashes(lines, spans)): sym[7] = h
+    return {"l": "js", "loc": len(lines), "doc": "", "top": tops, "s": syms, "c": out, "e": env,
+            "t": {k: sorted(v) for k, v in sref.items()}, "i": sorted(specs), "b": binds,
+            "x": {"n": ex, "re": rex, "st": stars}}
+
+# ---------------------------------------------------------------- TOML and JSON config keys
+
+TOML_HDR = re.compile(r"\s*\[\[?\s*([^\[\]]+?)\s*\]\]?\s*(?:#.*)?$")
+TOML_KEY = re.compile(r"""\s*((?:[A-Za-z0-9_-]+|"[^"\n]*"|'[^'\n]*')(?:\s*\.\s*(?:[A-Za-z0-9_-]+|"[^"\n]*"|'[^'\n]*'))*)\s*=""")
+TOML_PART = re.compile(r"""[A-Za-z0-9_-]+|"[^"\n]*"|'[^'\n]*'""")
+
+def cfg_refs(values):
+    refs = defaultdict(set)
+    for v in values:
+        m = ENTRY.match(v) if isinstance(v, str) and len(v) < 200 else None
+        if m: refs[m.group(1)].add("")
+    return {k: sorted(v) for k, v in refs.items()}
+
+def walk_values(d):
+    if isinstance(d, dict):
+        for v in d.values(): yield from walk_values(v)
+    elif isinstance(d, list):
+        for v in d: yield from walk_values(v)
+    else: yield d
+
+def parse_toml(src):
+    try: data = tomllib.loads(src)
+    except (tomllib.TOMLDecodeError, ValueError): data = None
+    lines = src.splitlines(); syms, pre, ml = [], [], None
+    def value(path):
+        d = data
+        for k in path:
+            if isinstance(d, list) and d: d = d[-1]
+            if not isinstance(d, dict) or k not in d: return None
+            d = d[k]
+        return d
+    for i, ln in enumerate(lines, 1):
+        if ml:
+            if ml in ln: ml = None
+            continue
+        h = TOML_HDR.match(ln)
+        if h:
+            pre = [x.strip("\"'") for x in TOML_PART.findall(h.group(1))]
+            if pre: syms.append([flat(pre[-1]), "toml", i, i, flat(".".join(pre)), "", "", vhash(ln.strip()), ""])
+            continue
+        k = TOML_KEY.match(ln)
+        if k:
+            path = pre + [x.strip("\"'") for x in TOML_PART.findall(k.group(1))]
+            rest = ln[k.end():]
+            v = value(path) if data is not None else None
+            syms.append([flat(path[-1]), "toml", i, i, flat(".".join(path)), "= " + flat(rest.strip())[:80], "",
+                         vhash(json.dumps(v, sort_keys=True, default=str) if v is not None else rest.strip()), ""])
+            for q in ('"""', "'''"):
+                if rest.count(q) == 1: ml = q
+    return {"l": "toml", "loc": len(lines), "doc": "", "top": [], "s": syms[:5000], "c": [], "e": [],
+            "r": cfg_refs(walk_values(data)) if data else {}}
+
+JSON_TOK = re.compile(r'"(?:\\.|[^"\\\n])*"|//[^\n]*|/\*.*?\*/|[{}\[\]:,]|[^\s{}\[\]:,"/]+|/', re.S)
+
+def parse_json(src):
+    """Keys with line numbers by a small tokenizer (tolerates // and /* */ comments and trailing commas, as in
+    tsconfig.json). Paths join object keys with dots; array elements share their array's path."""
+    syms, st, key, expect, line, last, vals = [], [], None, False, 1, 0, []
+    def emit(k, end, eline):
+        txt = src[k[3]:end].lstrip(" \t\r\n:").strip()
+        syms.append([flat(k[0]), "json", k[1], eline, flat(".".join(k[2])), "= " + flat(txt)[:80], "", vhash(txt), ""])
+    for m in JSON_TOK.finditer(src):
+        if len(syms) >= 5000: break
+        t = m.group(); p = m.start(); line += src.count("\n", last, p); last = p; ch = t[0]
+        if t.startswith(("//", "/*")): continue
+        if ch in "{[":
+            st.append([ch, key[2] if key else (st[-1][1] if st else []), key]); key = None; expect = ch == "{"
+        elif ch in "}]":
+            e = st.pop() if st else None
+            if e and e[2]: emit(e[2], m.end(), line)
+            key = None; expect = False
+        elif ch == ",": expect = bool(st) and st[-1][0] == "{"; key = None
+        elif ch == ":": pass
+        elif expect and st and st[-1][0] == "{":
+            try: nm = json.loads(t) if ch == '"' else t
+            except ValueError: nm = t.strip('"')
+            key = [str(nm), line, st[-1][1] + [str(nm)], m.end()]; expect = False
+        elif key:
+            emit(key, m.end(), line); key = None
+            if ch == '"': vals.append(t[1:-1])
+        elif ch == '"': vals.append(t[1:-1])
+    syms.sort(key=lambda x: x[2])
+    return {"l": "json", "loc": src.count("\n") + 1, "doc": "", "top": [], "s": syms, "c": [], "e": [], "r": cfg_refs(vals)}
+
+def parse_source(lang, src):
+    if lang == "py": return parse_py(src)
+    if lang == "js": return parse_js(src)
+    if lang == "toml": return parse_toml(src)
+    if lang == "json": return parse_json(src)
+    return empty(lang)
+
+def parse_path(f, lang):
+    try:
+        if os.path.getsize(os.path.join(R, f)) > MAX_BYTES: return empty(lang)
+        return parse_source(lang, read_text(f))
+    except OSError: return empty(lang)
+
+# ---------------------------------------------------------------- linking: modules, call targets, tests, dead code
+
+def pdot(f):
+    d = (f[:-3] if f.endswith(".py") else f).replace("/", ".")
+    return d[:-9] if d.endswith(".__init__") else ("" if d == "__init__" else d)
+
+class Linker:
+    def __init__(L, P):
+        L.P = P; files = sorted(P); L.files = files
+        L.py = [f for f in files if P[f]["l"] == "py"]
+        L.js = {f for f in files if P[f]["l"] == "js"}
+        L.initdirs = {os.path.dirname(f) for f in L.py if os.path.basename(f) == "__init__.py"}
+        # Canonical module name: the path, minus a leading src/. Aliases: the name implied by __init__.py files.
+        L.mods, L.alias, L.modof = {}, {}, {}
+        for f in L.py:
+            d = pdot(f); c = d[4:] if d.startswith("src.") else d
+            if not c or c in L.mods: c = d or f
+            L.mods[c] = f; L.modof[f] = c
+        for f in L.py:
+            L.alias.setdefault(pdot(f), f); L.alias.setdefault(L.initname(f), f)
+        L.tops = {m.split(".")[0] for m in list(L.mods) + list(L.alias)}
+        L.defs, L.classes = {}, {}
+        for f in L.py:
+            m = L.modof[f]
+            for s in P[f]["s"]:
+                L.defs.setdefault(m + "." + s[4], (f, s))
+            for q, bs in P[f].get("cb", {}).items(): L.classes[m + "." + q] = (f, bs)
+        L.jsq = {f: {s[4] for s in P[f]["s"]} for f in L.js}
+        L.memo, L.smemo, L.bmemo, L.jmemo = {}, {}, {}, {}
+
+    def initname(L, f):
+        d, parts = os.path.dirname(f), []
+        while d and d in L.initdirs: parts.append(os.path.basename(d)); d = os.path.dirname(d)
+        parts.reverse(); stem = os.path.basename(f)
+        stem = stem[:-3] if stem.endswith(".py") else stem
+        if stem != "__init__": parts.append(stem)
+        return ".".join(parts)
+
+    def split_mod(L, t, imp=None):
+        """Longest prefix of dotted t that is a repo module -> (canonical module, remaining parts) or (None, parts).
+        A file outside any package imports its sibling modules first, as a script does."""
+        sib = ""
+        if imp:
+            d = os.path.dirname(imp)
+            if d and d not in L.initdirs: sib = d.replace("/", ".") + "."
+        key = (t, sib)
+        if key in L.smemo: return L.smemo[key]
+        parts = t.split("."); r = (None, parts)
+        for i in range(len(parts), 0, -1):
+            n = ".".join(parts[:i])
+            f = (L.alias.get(sib + n) if sib else None) or L.mods.get(n) or L.alias.get(n)
+            if f: r = (L.modof[f], parts[i:]); break
+        L.smemo[key] = r
+        return r
+
+    def absolute(L, raw, f):
+        if not raw.startswith("@"): return raw
+        lv, _, rest = raw[1:].partition(":"); lv = int(lv)
+        m = L.modof.get(f, "")
+        if lv == 0: return m + ("." + rest if rest else "")
+        pkg = m.split(".") if os.path.basename(f) == "__init__.py" else m.split(".")[:-1]
+        if lv > 1: pkg = pkg[:max(0, len(pkg) - (lv - 1))]
+        return ".".join(pkg + ([rest] if rest else []))
+
+    def canon(L, raw, f):
+        t = L.absolute(raw, f)
+        m, rest = L.split_mod(t, f)
+        return ".".join([m] + rest) if m else t
+
+    def resolve(L, t, d=0):
+        """Repo symbol a canonical dotted name refers to, following re-exports, aliases and base classes."""
+        if t in L.defs: return t
+        if t in L.memo: return L.memo[t]
+        L.memo[t] = None
+        r = L._resolve(t, d) if d < 10 else None
+        L.memo[t] = r
+        return r
+
+    def _resolve(L, t, d):
+        if t.startswith("INST:"): return L.resolve(t[5:], d + 1)
+        m, rest = L.split_mod(t)
+        if m is None or not rest: return None
+        f = L.mods[m]
+        b = L.P[f].get("b", {}).get(rest[0])
+        if b and not b.startswith("@0:"):
+            b = b[5:] if b.startswith("INST:") else b
+            return L.resolve(".".join([L.canon(b, f)] + rest[1:]), d + 1)
+        for i in range(len(rest) - 1, 0, -1):
+            c = m + "." + ".".join(rest[:i])
+            if c in L.classes: return L.mro_lookup(c, rest[i]) if i == len(rest) - 1 else None
+        for s in L.P[f].get("st", []):
+            r = L.resolve(".".join([L.canon(s, f)] + rest), d + 1)
+            if r: return r
+        return None
+
+    def bases(L, c):
+        if c in L.bmemo: return L.bmemo[c]
+        out = L.bmemo[c] = []
+        f, bs = L.classes[c]
+        for b in bs:
+            r = L.resolve(L.canon(b, f)) if b else None
+            if r in L.classes: out.append(r)
+        return out
+
+    def mro_lookup(L, c, name, skip_self=False):
+        order, todo, seen = [], [c], set()
+        while todo:
+            k = todo.pop(0)
+            if k in seen: continue
+            seen.add(k); order.append(k); todo = L.bases(k) + todo
+        for k in order:
+            if skip_self and k == c: continue
+            if k + "." + name in L.defs: return k + "." + name
+        return None
+
+    def py_target(L, raw, f):
+        """(target, resolved?) for a Python call. External targets (os.path.join, builtins.len) count as resolved."""
+        if not raw: return "", False
+        if raw.startswith("SUPER:"):
+            c, _, name = raw[6:].partition("|"); c = L.canon(c, f)
+            r = L.mro_lookup(c, name, True) if c in L.classes else None
+            return (r, True) if r else ("", False)
+        if raw.startswith("STAR:"):
+            for s in L.P[f].get("st", []):
+                r = L.resolve(L.canon(s, f) + "." + raw[5:])
+                if r: return r, True
+            return "", False
+        t = L.canon(raw, f); r = L.resolve(t)
+        if r: return r, True
+        if not t.startswith("@") and t.split(".")[0] not in L.tops: return t, True
+        return "", False
+
+    def js_file(L, spec, imp):
+        if not spec.startswith("."): return None
+        key = (spec, os.path.dirname(imp))
+        if key in L.jmemo: return L.jmemo[key]
+        base = os.path.normpath(os.path.join(os.path.dirname(imp), spec)).replace(os.sep, "/")
+        cands = [base] + [base + e for e in JS_EXT] + [base + "/index" + e for e in JS_EXT]
+        stem, ext = os.path.splitext(base)
+        if ext in (".js", ".jsx", ".mjs", ".cjs"): cands += [stem + e for e in (".ts", ".tsx", ".mts", ".cts")]
+        r = next((x for x in cands if x in L.js), None)
+        L.jmemo[key] = r
+        return r
+
+    def js_export(L, f, name, d=0):
+        x = L.P[f].get("x", {})
+        q = x.get("n", {}).get(name)
+        if q: return f, q
+        if d > 6: return None
+        for spec, orig, as_ in x.get("re", []):
+            if as_ == name:
+                tf = L.js_file(spec, f)
+                if not tf: return None
+                return (tf, "*") if orig == "*" else L.js_export(tf, orig, d + 1)
+        if name != "default":
+            for spec in x.get("st", []):
+                tf = L.js_file(spec, f); r = tf and L.js_export(tf, name, d + 1)
+                if r: return r
+            if name in L.jsq[f]: return f, name       # declared at top level; export form not recognised
+        return None
+
+    def js_target(L, raw, f):
+        k, _, rest = raw.partition("|")
+        if k == "L": return (f + "#" + rest, True) if rest in L.jsq[f] else ("", False)
+        if k == "G": return rest, True
+        if k != "I": return "", False
+        spec, name, tail = rest.split("|"); tail = tail.split(".") if tail else []
+        tf = L.js_file(spec, f)
+        if tf is None:
+            if spec.startswith("."): return "", False
+            return spec + "#" + ".".join(([] if name in ("*", "default") else [name]) + tail or ["default"]), True
+        if name == "*":
+            if not tail: name = "default"
+            else: name, tail = tail[0], tail[1:]
+        r = L.js_export(tf, name)
+        if r and r[1] == "*" and tail: r = L.js_export(r[0], tail[0]); tail = tail[1:]
+        if r is None:
+            dq = L.P[tf].get("x", {}).get("n", {}).get("default")
+            r = (tf, dq + "." + name) if dq else None
+        if r is None: return "", False
+        full = ".".join([r[1]] + tail)
+        return (r[0] + "#" + full, True) if full in L.jsq.get(r[0], ()) else ("", False)
+
+    def base(L, f):
+        return L.modof[f] + "." if L.P[f]["l"] == "py" else f + "#"
+
+def aggregate(code, P):
+    L = Linker(P); files = L.files
+    srow, crow, rrow, nres = [], [], [], 0
+    cfg_leaf, cfg_path = defaultdict(list), {}
+    for f in files:
+        if P[f]["l"] in ("toml", "json"):
+            for s in P[f]["s"]: cfg_leaf[s[0]].append(f"{f}:{s[2]}"); cfg_path.setdefault(s[4], f"{f}:{s[2]}")
+    for f in files:
+        d = P[f]; lang = d["l"]
+        base = L.base(f) if lang in ("py", "js") else f + "#"
+        for s in d["s"]:
+            srow.append((s[0], s[1], f"{f}:{s[2]}", s[4], s[3], base + s[4], s[5], s[6]))
+        if lang not in ("py", "js"): continue
+        for var, line, sc in d.get("e", []):
+            scf = base + (sc or "<module>")
+            srow.append((var, "env", f"{f}:{line}", var, line, scf, "", ""))
+            rrow.append((scf, "env", var, f"{f}:{line}", ""))
+        tgt = L.py_target if lang == "py" else L.js_target
+        for name, line, sc, raw in d["c"]:
+            t, ok = tgt(raw, f); nres += ok
+            crow.append((name, f"{f}:{line}", base + (sc or "<module>"), t or "-", "resolved" if ok else "name-only", sc or "<module>"))
+        for s, scopes in d.get("t", {}).items():
+            # A string literal naming a config key counts as reading it: the full dotted path, or a distinctive leaf.
+            hit = cfg_path.get(s) or (cfg_leaf[s][0] if s in cfg_leaf and re.search(r"[_\-A-Z0-9.]", s) else None)
+            if hit:
+                for sc in scopes: rrow.append((base + (sc or "<module>"), "config", s, f"{f}", hit))
+    # tests: imports (resolved to repo files), plus paths and dotted module names in test string literals
+    deps = defaultdict(set)
+    for f in L.py:
+        for raw in P[f].get("i", []):
+            m, _ = L.split_mod(L.absolute(raw, f), f)
+            if m: deps[f].add(L.mods[m])
+    for f in L.js:
+        for spec in P[f].get("i", []):
+            tf = L.js_file(spec, f)
+            if tf: deps[f].add(tf)
+    for f in deps: deps[f].discard(f)
+    tests = [f for f in files if is_test(f) and P[f]["l"] in ("py", "js")]
+    srcs = [f for f in files if not is_test(f) and P[f]["l"] in ("py", "js")]
     tmap = defaultdict(set)
-    texts = {}
+    bn = {}                       # unique basenames: tests that run a script by name (subprocess) still count
+    for f in srcs: b = os.path.basename(f); bn[b] = None if b in bn else f
     for t in tests:
-        try: texts[t] = open(os.path.join(R, t), encoding="utf-8", errors="replace").read()
-        except Exception: texts[t] = ""
+        for d in deps[t]:
+            if not is_test(d): tmap[d].add(t)
+        for s in P[t].get("t", {}):
+            if bn.get(s): tmap[bn[s]].add(t)
+            if "/" in s:
+                if s in P and not is_test(s): tmap[s].add(t)
+            elif "." in s and P[t]["l"] == "py":
+                m, _ = L.split_mod(s)
+                if m and not is_test(L.mods[m]): tmap[L.mods[m]].add(t)
+    rdeps = defaultdict(set)
+    for f, ds in deps.items():
+        for d in ds: rdeps[d].add(f)
+    ind = {}
     for s in srcs:
-        d = dotted(s); base = os.path.basename(s)
-        for t in tests:
-            im = imps[t]
-            hit = any(i == d or i.startswith(d + ".") or i.lstrip(".") == d for i in im) \
-                or (s in texts[t]) or ("'" + d + "'" in texts[t]) or ('"' + d + '"' in texts[t])
-            if not hit:  # "from pkg import mod" style
-                pk, _, leaf = d.rpartition(".")
-                hit = bool(pk) and (pk + "." + leaf) in im
-            if hit: tmap[s].add(t)
-    # indirect: tests of src modules that import s (1 hop)
-    ind = defaultdict(set)
-    for s in srcs:
-        d = dotted(s)
-        for o in srcs:
-            if o != s and any(i == d or i.startswith(d + ".") for i in imps[o]):
-                ind[s] |= tmap.get(o, set())
-        ind[s] -= tmap.get(s, set())
-    # area fallback from tests/AREAS.toml if present
+        ind[s] = set().union(*[tmap.get(o, set()) for o in rdeps[s] if not is_test(o)]) - tmap.get(s, set())
     areas = []
     ap = os.path.join(R, "tests/AREAS.toml")
     if os.path.exists(ap):
-        try: areas = tomllib.load(open(ap, "rb")).get("area", [])
-        except Exception: pass
-    os.makedirs(IDX, exist_ok=True)
-    w = lambda n, rows: open(os.path.join(IDX, n), "w").write("".join("\t".join(map(str, r)) + "\n" for r in rows))
-    w("symbols.tsv", sorted((s[0], s[2], f"{s[3]}:{s[4]}", s[1], s[5]) for s in sym))
-    w("callers.tsv", sorted((c[0], f"{c[1]}:{c[2]}", c[3]) for c in calls))
-    w("testmap.tsv", [(s, " ".join(sorted(tmap.get(s, ()))), " ".join(sorted(ind[s]))) for s in sorted(set(tmap) | {k for k in ind if ind[k]})])
-    area_rows = []
-    for a in areas:
-        area_rows.append((a.get("name", ""), " ".join(a.get("src", [])), " ".join(a.get("tests", []))))
-    w("areas.tsv", area_rows)
-    # CODEMAP.md
+        try:
+            with open(ap, "rb") as fh: areas = tomllib.load(fh).get("area", [])
+        except (OSError, tomllib.TOMLDecodeError): pass
+    # dead: Python defs (outside tests) whose name is never referenced outside tests and outside their own body
+    cand = defaultdict(list)
+    for f in L.py:
+        if is_test(f): continue
+        for s in P[f]["s"]:
+            if s[1] in ("def", "method", "class") and not (s[0].startswith("__") and s[0].endswith("__")):
+                cand[s[0]].append((L.modof[f] + "." + s[4], f, s))
+    alive = set()
+    def mark(refs, f, base):
+        for n, scopes in refs.items():
+            for fq, cf, _ in cand.get(n, ()):
+                if fq in alive: continue
+                for sc in scopes:
+                    full = base + sc if sc and base else ""
+                    if cf != f or not full or not (full == fq or full.startswith(fq + ".")): alive.add(fq); break
+    for f in files:
+        if is_test(f): continue
+        d = P[f]
+        if d["l"] == "py":
+            mark(d.get("r", {}), f, L.modof[f] + ".")
+            strs = defaultdict(list)
+            for s, scopes in d.get("t", {}).items(): strs[re.split(r"[.:]", s)[-1]] += scopes
+            mark(strs, f, L.modof[f] + ".")
+        elif d["l"] in ("toml", "json"): mark(d.get("r", {}), f, "")
+    drow = []
+    for n, cs in cand.items():
+        for fq, f, s in cs:
+            if fq in alive: continue
+            flags = ["@" + x for x in s[8].split()]
+            if s[1] == "method":
+                c = fq.rsplit(".", 1)[0]
+                if c in L.classes and len(L.bases(c)) < len([b for b in L.classes[c][1] if b != "builtins.object"]): flags.append("ext-base")
+            drow.append((s[3] - s[2] + 1, s[1], f"{f}:{s[2]}", fq, " ".join(flags)))
+    drow.sort(key=lambda r: (-r[0], r[2]))
+    # write
+    w = lambda n, rows: write(n, "".join("\t".join(map(str, r)) + "\n" for r in rows))
+    w("symbols.tsv", sorted(srow))
+    w("callers.tsv", sorted(crow))
+    w("reads.tsv", sorted(set(rrow)))
+    w("deps.tsv", [(f, " ".join(sorted(deps[f]))) for f in sorted(deps) if deps[f]])
+    w("testmap.tsv", [(s, " ".join(sorted(tmap.get(s, ()))), " ".join(sorted(ind.get(s, ())))) for s in sorted(set(tmap) | {k for k in ind if ind[k]})])
+    w("areas.tsv", [(a.get("name", ""), " ".join(a.get("src", [])), " ".join(a.get("tests", []))) for a in areas])
+    w("dead.tsv", drow)
     out = ["# CODEMAP (generated by codeindex; do not edit). Format: path | LOC | purpose | key symbols | tests",
-           "Query: codeindex where X | callers X | tests PATH | map DIR | find WORD", ""]
-    for f in sorted(mods):
-        if f.startswith("tests/"): continue
-        d, top, n = mods[f]
+           "Query: codeindex where X | callers X | tests PATH | map DIR | find WORD | context X | impact X", ""]
+    for f in srcs:
+        d = P[f]; top = d.get("top", [])
         tt = sorted(tmap.get(f, []))
         tshow = ",".join(os.path.basename(x) for x in tt[:3]) + (f"+{len(tt)-3}" if len(tt) > 3 else "")
-        out.append(f"{f} | {n} | {d} | {' '.join(top[:8])}{'...' if len(top) > 8 else ''} | {tshow}")
+        out.append(f"{f} | {d.get('loc', 0)} | {d.get('doc', '')} | {' '.join(top[:8])}{'...' if len(top) > 8 else ''} | {tshow}")
     out.append("\n## tests (dir: count)")
     cnt = defaultdict(int)
     for t in tests: cnt[os.path.dirname(t)] += 1
     out += [f"{k}: {v}" for k, v in sorted(cnt.items())]
     cm = "\n".join(out) + "\n"
-    open(os.path.join(IDX, "CODEMAP.md"), "w").write(cm)
-    open(os.path.join(R, "CODEMAP.md"), "w").write(cm)
-    open(os.path.join(IDX, "stamp"), "w").write(subprocess.run(["git", "-C", R, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip() + " " + time.strftime("%F %T") + "\n")
-    print(f"codeindex: {len(mods)} files ({redone} reparsed) {len(sym)} symbols {len(calls)} calls {len(tmap)} src->tests in {time.time()-t0:.1f}s")
+    write("CODEMAP.md", cm)
+    try:
+        with open(os.path.join(R, "CODEMAP.md"), encoding="utf-8") as fh: same = fh.read() == cm
+    except OSError: same = False
+    if not same:
+        with open(os.path.join(R, "CODEMAP.md"), "w", encoding="utf-8") as fh: fh.write(cm)
+    return {"symbols": len(srow), "calls": len(crow), "resolved": nres, "tested": len(tmap), "dead": len(drow)}
+
+# ---------------------------------------------------------------- build
+
+class Lock:
+    def __enter__(s):
+        s.fh = open(ipath("lock"), "w")
+        try:
+            import fcntl; fcntl.flock(s.fh, fcntl.LOCK_EX)
+        except ImportError: pass
+    def __exit__(s, *a): s.fh.close()
+
+OUTPUTS = ("symbols.tsv", "callers.tsv", "testmap.tsv", "deps.tsv", "reads.tsv", "dead.tsv", "CODEMAP.md", "parsed.json")
+
+def build(full=False, quiet=False):
+    """Incremental: unchanged blob hashes and FORMAT -> nothing to do; otherwise re-parse the changed files only,
+    then relink everything (linking needs no file reads)."""
+    t0 = time.time()
+    os.makedirs(IDX, exist_ok=True)
+    with Lock():
+        meta = jload("meta.json") or {}
+        ok = not full and meta.get("format") == FORMAT and all(os.path.exists(ipath(n)) for n in OUTPUTS)
+        old = read_hashes() if ok else {}
+        cur = scan(old)
+        code = {f: v for f, v in cur.items() if v[1] in LANGS}
+        if ok and code == {f: v for f, v in old.items() if v[1] in LANGS}:
+            if cur != old: write("hashes.tsv", "".join(f"{f}\t{s}\t{l}\n" for f, (s, l) in sorted(cur.items())))
+            if not quiet: print(f"codeindex: up to date, {len(code)} files (0 reparsed) in {time.time()-t0:.2f}s")
+            return False
+        P = (jload("parsed.json") or {}) if ok else {}
+        redo = [f for f, (sha, lang) in code.items() if f not in P or P[f].get("h") != sha or P[f].get("l") != lang]
+        for f in redo:
+            P[f] = parse_path(f, code[f][1]); P[f]["h"] = code[f][0]
+        for f in [f for f in P if f not in code]: del P[f]
+        st = aggregate(code, P)
+        write("parsed.json", json.dumps(P, separators=(",", ":")))
+        write("hashes.tsv", "".join(f"{f}\t{s}\t{l}\n" for f, (s, l) in sorted(cur.items())))
+        head = git("rev-parse", "--short", "HEAD", check=False).strip()
+        write("stamp", head + " " + time.strftime("%F %T") + "\n")
+        write("meta.json", json.dumps({"format": FORMAT, "version": VERSION, "head": head, "built": time.strftime("%F %T"),
+                                       "files": len(code), **st}))
+    if os.path.exists(ipath("cache.pkl")): os.remove(ipath("cache.pkl"))     # format-1 cache
+    pct = 100 * st["resolved"] // max(1, st["calls"])
+    if not quiet:
+        print(f"codeindex: {len(code)} files ({len(redo)} reparsed) {st['symbols']} symbols {st['calls']} calls "
+              f"({pct}% resolved) {st['tested']} src->tests in {time.time()-t0:.2f}s")
     # graphify graph (AST only, no LLM): only when sources changed; background unless CODEINDEX_WAIT=1
-    if shutil.which("graphify") and os.environ.get("CODEINDEX_NO_GRAPH") != "1":
-        h = hashlib.md5("".join(f"{f}{ncache[f][0]}" for f in sorted(ncache) if f.endswith((".py", ".js", ".ts", ".sh"))).encode()).hexdigest()
+    if not quiet and shutil.which("graphify") and os.environ.get("CODEINDEX_NO_GRAPH") != "1":
+        h = hashlib.md5("".join(f"{f}{s}" for f, (s, l) in sorted(code.items()) if l in ("py", "js")).encode()).hexdigest()
         sp = os.path.join(IDX, "graphsig")
         old = open(sp).read().strip() if os.path.exists(sp) else ""
         if old == h and os.path.exists(os.path.join(R, "graphify-out/graph.json")):
@@ -197,42 +1169,507 @@ def build():
             else:
                 subprocess.Popen(["nice", "-n", "19", "sh", "-c", cmd], start_new_session=True)
                 print("graphify: refreshing in background (set CODEINDEX_WAIT=1 to block)")
+    return True
 
-def grep_tsv(name, pat, col=0, exact=True, limit=60):
-    p = os.path.join(IDX, name)
-    if not os.path.exists(p): sys.exit("no index: run `codeindex build`")
-    n = 0
-    for ln in open(p):
-        c = ln.rstrip("\n").split("\t")
-        v = c[col]
-        if (v == pat) if exact else (pat in v):
-            print(ln.rstrip("\n").replace("\t", "  ")); n += 1
-            if n >= limit: print(f"... capped at {limit}"); break
-    if not n: print("none")
+# ---------------------------------------------------------------- queries (each returns text)
+
+_rows = {}
+def rows(n):
+    p = ipath(n)
+    try: st = os.stat(p)
+    except OSError: raise NoIndex()
+    k = (st.st_mtime_ns, st.st_size)
+    if n not in _rows or _rows[n][0] != k:
+        with open(p, encoding="utf-8") as fh: _rows[n] = (k, [ln.rstrip("\n").split("\t") for ln in fh])
+    return _rows[n][1]
+
+def split_loc(loc):
+    f, _, ln = loc.rpartition(":"); return f, int(ln)
+
+def loc_key(loc):
+    f, ln = split_loc(loc); return f, ln
+
+KIND_RANK = {"class": 0, "def": 0, "function": 0, "method": 0, "interface": 1, "type": 1, "enum": 1, "var": 2,
+             "const": 2, "toml": 3, "json": 3, "env": 4}
+
+def match_syms(x, kinds=None):
+    out = []
+    for r in rows("symbols.tsv"):
+        name, kind, loc, qual, end, fq = r[:6]
+        if kinds and kind not in kinds: continue
+        if x == fq: rk = 0
+        elif x == qual and qual != name: rk = 1
+        elif x == name: rk = 2
+        elif fq.endswith("." + x) or fq.endswith("#" + x): rk = 3
+        else: continue
+        out.append((rk, KIND_RANK.get(kind, 5), is_test(loc), loc_key(loc), r))
+    if not out:
+        lx = x.lower()
+        for r in rows("symbols.tsv"):
+            if (r[0].lower() == lx or r[3].lower() == lx) and (not kinds or r[1] in kinds):
+                out.append((4, KIND_RANK.get(r[1], 5), is_test(r[2]), loc_key(r[2]), r))
+    return [o[-1] for o in sorted(out)]
+
+def fmt_sym(r):
+    name, kind, loc, qual, end, fq, sig, doc = r
+    if kind == "env": return f"{loc}  env  {name}  (read in {fq})"
+    if kind in ("toml", "json"): return f"{loc}  {kind}  {qual} {sig}".rstrip()
+    return f"{loc}  {kind}  {fq}{sig}" + (f"  {doc}" if doc else "")
+
+def capped(lines, limit, what="results"):
+    if len(lines) > limit: return lines[:limit] + [f"... {len(lines) - limit} more {what} (--limit N)"]
+    return lines
+
+def q_where(x, limit=60):
+    m = match_syms(x)
+    return "\n".join(capped([fmt_sym(r) for r in m], limit)) + "\n" if m else f"none (try: codeindex find {x})\n"
+
+def q_find(w, limit=60):
+    lw = w.lower()
+    m = sorted((r for r in rows("symbols.tsv") if lw in r[0].lower()), key=lambda r: (r[0].lower(), loc_key(r[2])))
+    return "\n".join(capped([fmt_sym(r) for r in m], limit)) + "\n" if m else "none\n"
+
+def caller_rows(x):
+    q = "." in x or "#" in x; last = re.split(r"[.#]", x)[-1]
+    out = []
+    for r in rows("callers.tsv"):
+        name, loc, caller, tgt, st = r[:5]
+        if st == "resolved":   # a bare name also matches calls made through an alias (`from m import f as g`)
+            hit = tgt == x or tgt.endswith("." + x) or tgt.endswith("#" + x) or (not q and name == x)
+        else: hit = name == last
+        if hit: out.append(r)
+    out.sort(key=lambda r: (r[4] != "resolved", loc_key(r[1])))
+    return out
+
+def q_callers(x, resolved=False, limit=60):
+    m = caller_rows(x)
+    if resolved: m = [r for r in m if r[4] == "resolved"]
+    if not m: return "none\n"
+    nr = sum(r[4] == "resolved" for r in m)
+    head = f"{len(m)} call sites of {x}: {nr} resolved, {len(m) - nr} name-only (same name, target unknown)"
+    body = [f"{r[1]}  {r[4]:<9}  {r[2]} -> {r[3] if r[4] == 'resolved' else r[0] + '?'}" for r in m]
+    return "\n".join([head] + capped(body, limit, "call sites")) + "\n"
+
+def file_tests(f):
+    for s, t, i in rows("testmap.tsv"):
+        if s == f: return t.split(), i.split()
+    return [], []
+
+def in_index(x):
+    for r in rows("symbols.tsv"):
+        if r[2].rpartition(":")[0] == x: return True
+    return x in (read_hashes() or {})
+
+def q_tests(x):
+    x = x.removeprefix("./"); out = []
+    for s, t, i in rows("testmap.tsv"):
+        if s == x or s.endswith("/" + x):
+            out.append(f"{s} direct: {t or '-'}\n{s} indirect(1 hop, importers' tests): {i or '-'}")
+    try:
+        for n, src, ts in rows("areas.tsv"):
+            if any(fnmatch.fnmatch(x, g) for g in src.split()): out.append(f"area {n}: {ts}")
+    except NoIndex: pass
+    if not out and not in_index(x):
+        syms = match_syms(x, CODE_KINDS)
+        if syms:
+            fq = syms[0][5]; f = split_loc(syms[0][2])[0]
+            calls = sorted({test_id(r) for r in caller_rows(fq) if r[4] == "resolved" and r[3] == fq and is_test(r[1])})
+            t, i = file_tests(f)
+            out.append(f"{fq} called by tests: {' '.join(calls) or '-'}")
+            out.append(f"{f} direct: {' '.join(t) or '-'}\n{f} indirect(1 hop, importers' tests): {' '.join(i) or '-'}")
+    return "\n".join(out) + "\n" if out else "none (try: codeindex callers <symbol>, or grep -l the module name in tests/)\n"
+
+def test_id(r):
+    f = split_loc(r[1])[0]; sc = r[5] if len(r) > 5 else "<module>"
+    return f if sc == "<module>" else f + "::" + sc.replace(".", "::")
+
+def q_map(prefix=""):
+    try:
+        with open(ipath("CODEMAP.md"), encoding="utf-8") as fh: ls = fh.read().splitlines()
+    except OSError: raise NoIndex()
+    return "".join(ln + "\n" for ln in ls if not prefix or ln.startswith(prefix))
+
+def q_changed(sha):
+    try: base = git("rev-parse", "--verify", "--quiet", sha + "^{commit}").strip()
+    except subprocess.CalledProcessError: return f"unknown commit: {sha}\n"
+    toks = git("diff", "--name-status", "-M", "-z", base).split("\0")
+    pairs, i = [], 0
+    while i < len(toks) and toks[i]:
+        st = toks[i]
+        if st[0] in "RC": pairs.append((toks[i + 1] if st[0] == "R" else None, toks[i + 2])); i += 3
+        else: pairs.append((None if st[0] == "A" else toks[i + 1], None if st[0] == "D" else toks[i + 1])); i += 2
+    pairs += [(None, f) for f in git("ls-files", "-o", "--exclude-standard", "-z").split("\0") if f and lang_of(f)]
+    out, n = [], {"+": 0, "-": 0, "~": 0}
+    for old, new in pairs:
+        lang = lang_of(new or old)
+        if lang == "?": lang = peek(os.path.join(R, new)) if new else "-"
+        if lang not in LANGS: continue
+        try: a = parse_source(lang, git("show", f"{base}:{old}"))["s"] if old else []
+        except subprocess.CalledProcessError: a = []
+        try: b = parse_source(lang, read_text(new))["s"] if new else []
+        except OSError: b = []
+        def keyed(syms):
+            seen, d = defaultdict(int), {}
+            for s in syms:
+                k = (s[4], s[1]); d[(k, seen[k])] = s; seen[k] += 1
+            return d
+        ka, kb = keyed(a), keyed(b)
+        for k, s in kb.items():
+            if k not in ka: out.append(((new, s[2]), f"+ {s[1]:<8} {s[4]}  {new}:{s[2]}")); n["+"] += 1
+            elif ka[k][7] != s[7]: out.append(((new, s[2]), f"~ {s[1]:<8} {s[4]}  {new}:{s[2]}")); n["~"] += 1
+        for k, s in ka.items():
+            if k not in kb: out.append(((new or old, s[2]), f"- {s[1]:<8} {s[4]}  {old}:{s[2]} (in {sha})")); n["-"] += 1
+    out.sort()
+    head = f"changed since {sha}: {n['+']} added, {n['-']} removed, {n['~']} changed in {len(pairs)} files"
+    return "\n".join([head] + [x[1] for x in out]) + "\n"
+
+def q_dead(limit=50):
+    d = rows("dead.tsv")
+    head = (f"{len(d)} Python symbols with no references outside tests and outside their own body (name-based: any "
+            "same-named attribute or string counts as a use; dynamic dispatch is not seen). size kind loc symbol flags")
+    body = [f"{r[0]:>5}  {r[1]:<6}  {r[2]}  {r[3]}  {r[4]}".rstrip() for r in d]
+    return "\n".join([head] + capped(body, limit, "symbols")) + "\n"
+
+# ---------------------------------------------------------------- context and impact
+
+def git_commits(f, a=None, b=None, n=3):
+    fmt = ["--format=%h %ad %s", "--date=short"]
+    if a:
+        out = git("log", f"-L{a},{b}:{f}", "-n", str(n), "-s", *fmt, check=False).strip()
+        if out: return out.splitlines()[:n], "lines"
+    out = git("log", "-n", str(n), *fmt, "--", f, check=False).strip()
+    return (out.splitlines()[:n], "file") if out else ([], "file")
+
+_lines = {}
+def file_lines(f):
+    if f not in _lines:
+        try: _lines[f] = read_text(f).splitlines()
+        except OSError: _lines[f] = []
+    return _lines[f]
+
+def src_line(loc):
+    f, ln = split_loc(loc); ls = file_lines(f)
+    return ls[ln - 1].strip() if 0 < ln <= len(ls) else ""
+
+def size(lines): return sum(len(x) + 1 for x in lines)
+
+def cut(lines, cap):
+    """Longest prefix of lines that fits cap characters (newlines included), with a '... +N more lines' marker."""
+    if size(lines) <= cap: return list(lines)
+    out, used = [], 0
+    for i, ln in enumerate(lines):
+        mark = f"... +{len(lines) - i} more lines"
+        if used + len(ln) + 1 + len(mark) + 1 > cap:
+            if not out and cap - len(mark) - 6 > 20: out.append(ln[:cap - len(mark) - 6] + " ..."); used += len(out[0]) + 1
+            if used + len(mark) + 1 <= cap: out.append(mark)
+            return out
+        out.append(ln); used += len(ln) + 1
+    return out
+
+def pack(budget, head, secs):
+    """Deterministic fit: the head gets up to 35% of the budget; sections share the rest by weight, a section that
+    needs less than its share gives the surplus to the others, and each is cut at a line boundary."""
+    h = cut(head, max(min(size(head), budget // 3), min(120, budget)))
+    need = [size([t] + ls) for t, ls, _ in secs]
+    def allocate(rem, skip):
+        alloc, act, pool = [0] * len(secs), [i for i in range(len(secs)) if i not in skip], rem
+        while act:
+            tw = sum(secs[i][2] for i in act)
+            give = {i: pool * secs[i][2] / tw for i in act}
+            done = [i for i in act if need[i] <= give[i]]
+            if not done:
+                for i in act: alloc[i] = int(give[i])
+                break
+            for i in done: alloc[i] = need[i]; pool -= need[i]; act.remove(i)
+        return alloc
+    # A section whose share cannot hold its title and a "... +N more lines" marker is dropped and named in a footer.
+    skip, note = set(), ""
+    for _ in range(len(secs)):
+        alloc = allocate(budget - size(h) - (len(note) + 1 if note else 0), skip)
+        tiny = {i for i, (t, ls, _) in enumerate(secs) if i not in skip and alloc[i] < need[i] and alloc[i] < len(t) + 26}
+        if not tiny: break
+        skip |= tiny
+        note = "... over budget, skipped: " + ", ".join(secs[i][0].split(" (")[0].lstrip("# ") for i in sorted(skip))
+    out = list(h)
+    for i, ((t, ls, _), a) in enumerate(zip(secs, alloc)):
+        if i not in skip: out += [t] + cut(ls, a - len(t) - 1)
+    if note: out.append(note)
+    text = "".join(x + "\n" for x in out)
+    return text if len(text) <= budget else text[:budget].rsplit("\n", 1)[0] + "\n"
+
+def py_parts(f, ln, end, name):
+    """(header lines: decorators + signature + docstring, body lines) of the Python def/class at line ln."""
+    ls = file_lines(f); start = ln
+    while start > 1 and ls[start - 2].strip().startswith("@"): start -= 1
+    try: tree = ast.parse("\n".join(ls))
+    except (SyntaxError, ValueError): return ls[start - 1:ln], ls[ln:end]
+    node = next((n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                 and n.lineno == ln and n.name == name), None)
+    if node is None or not node.body: return ls[start - 1:ln], ls[ln:end]
+    b0 = node.body[0]
+    if b0.lineno <= ln: return ls[start - 1:ln], ls[ln:end]
+    hd = ls[start - 1:b0.lineno - 1]
+    if ast.get_docstring(node) is not None: return hd + ls[b0.lineno - 1:b0.end_lineno], ls[b0.end_lineno:end]
+    return hd, ls[b0.lineno - 1:end]
+
+def js_parts(f, ln, end):
+    ls = file_lines(f); i = ln - 1
+    while i > 0 and ls[i - 1].strip().startswith("@"): i -= 1
+    j = i
+    if j > 0 and ls[j - 1].rstrip().endswith("*/"):
+        k = j - 1
+        while k >= 0 and j - k < 60 and "/*" not in ls[k]: k -= 1
+        if k >= 0 and "/*" in ls[k]: j = k
+    return ls[j:ln], ls[ln:end]
+
+def q_context(x, budget=4000):
+    budget = max(200, int(budget)); x = x.strip().removeprefix("./")
+    if in_index(x): return ctx_file(x, budget)
+    m = match_syms(x, None)
+    if not m: return f"none: no symbol or file {x!r} (try: codeindex find {x})\n"
+    code = [r for r in m if r[1] not in ("env", "toml", "json")]
+    if not code:
+        return pack(budget, [f"# {x}: config/env entries"], [("## entries", [fmt_sym(r) + "  | " + src_line(r[2]) for r in m], 1)])
+    r = code[0]
+    name, kind, loc, qual, end, fq, sig, doc = r
+    f, ln = split_loc(loc); end = int(end)
+    head = [f"# {fq}  {kind}  {f}:{ln}-{end}"]
+    if len(code) > 1: head.append("also: " + ", ".join(f"{o[5]} ({o[2]})" for o in code[1:6]) + (" ..." if len(code) > 6 else ""))
+    hd, body = py_parts(f, ln, end, name) if P_lang(f) == "py" else js_parts(f, ln, end)
+    head += hd
+    if kind == "class":
+        mem = [s for s in rows("symbols.tsv") if s[1] in CODE_KINDS and s[5].startswith(fq + ".") and "." not in s[5][len(fq) + 1:]]
+        mem.sort(key=lambda s: loc_key(s[2]))
+        body_sec = (f"## members ({len(mem)})", [f"L{split_loc(s[2])[1]} {s[0]}{s[6]}" + (f"  {s[7]}" if s[7] else "") for s in mem], 4)
+    else:
+        body_sec = (f"## body (lines {ln + 1}-{end})" if body else "## body: (on the definition line)", body, 4)
+    C = rows("callers.tsv")
+    res = sorted((c for c in C if c[4] == "resolved" and c[3] == fq), key=lambda c: loc_key(c[1]))
+    nam = sorted((c for c in C if c[4] == "name-only" and c[0] == name), key=lambda c: loc_key(c[1]))
+    cl = [f"{c[1]}  {c[2]}  | {src_line(c[1])[:140]}" for c in res] + [f"{c[1]}? {c[2]}  | {src_line(c[1])[:140]}" for c in nam]
+    seen, ce = set(), []
+    for c in sorted((c for c in C if c[2] == fq or c[2].startswith(fq + ".")), key=lambda c: loc_key(c[1])):
+        t = c[3] if c[4] == "resolved" else c[0] + "?"
+        if t not in seen: seen.add(t); ce.append(f"L{split_loc(c[1])[1]} {t}")
+    tcall = sorted({test_id(c) for c in res if is_test(c[1])})
+    t, i = file_tests(f)
+    tl = tcall + [f"{x} (imports {f})" for x in t if not any(y.startswith(x) for y in tcall)]
+    tl += [f"{x} (1 hop)" for x in i[:5]]
+    cm, how = git_commits(f, ln, end)
+    secs = [body_sec,
+            (f"## callers ({len(res)} resolved, {len(nam)} name-only marked ?)", cl, 3),
+            (f"## callees ({len(ce)}; ? = name-only)", ce, 1.5),
+            (f"## tests ({len(tl)})", tl or ["none found"], 1),
+            (f"## commits ({'touching these lines' if how == 'lines' else 'touching the file'})", cm or ["none"], 1)]
+    return pack(budget, head, secs)
+
+def P_lang(f):
+    if f.endswith(".py"): return "py"
+    return "js" if f.endswith(JS_EXT) else read_hashes().get(f, ("", ""))[1]
+
+def ctx_file(f, budget):
+    syms = sorted((r for r in rows("symbols.tsv") if r[2].rpartition(":")[0] == f and r[1] != "env"), key=lambda r: loc_key(r[2]))
+    ls = file_lines(f)
+    cm_line = next((ln for ln in q_map(f).splitlines() if ln.startswith(f + " |")), "")
+    head = [f"# file {f}  {len(ls)} lines", cm_line] if cm_line else [f"# file {f}  {len(ls)} lines"]
+    outline = [f"L{split_loc(r[2])[1]} {r[1]} {r[3]}{r[6] if r[1] not in ('toml', 'json') else ' ' + r[6]}".rstrip() for r in syms]
+    deps = {a: b.split() for a, b in rows("deps.tsv")}
+    imps = deps.get(f, []); by = sorted(a for a, b in deps.items() if f in b)
+    t, i = file_tests(f)
+    reads = sorted({f"{r[1]} {r[2]}" for r in rows("reads.tsv") if r[3].rpartition(":")[0] == f or r[3] == f})
+    cm, _ = git_commits(f)
+    secs = [(f"## outline ({len(outline)})", outline, 4), (f"## imported by ({len(by)})", by, 2),
+            (f"## imports ({len(imps)})", imps, 1), (f"## tests", [f"direct: {' '.join(t) or '-'}", f"1 hop: {' '.join(i) or '-'}"], 1),
+            (f"## reads ({len(reads)})", reads, 1), ("## commits", cm or ["none"], 1)]
+    return pack(budget, head, secs)
+
+def impact_data(x, depth=3):
+    """Targets, callers up to depth (resolved edges expanded; name-only matches listed at depth 1 only),
+    tests to run and env/config reads of the targets and their callees."""
+    x = x.strip().removeprefix("./")
+    if in_index(x):
+        targets = [r for r in rows("symbols.tsv") if r[2].rpartition(":")[0] == x and r[1] in CODE_KINDS]
+        label, files = f"file {x}", {x}
+        if not targets and not os.path.exists(os.path.join(R, x)): return None
+    else:
+        m = match_syms(x, CODE_KINDS)
+        if not m: return None
+        r = m[0]; targets = [r] + [s for s in rows("symbols.tsv") if r[1] == "class" and s[5].startswith(r[5] + ".") and s[1] in CODE_KINDS]
+        label, files = f"{r[5]} ({r[1]} {r[2]})", {split_loc(r[2])[0]}
+    C = rows("callers.tsv")
+    by_t, by_n, fwd = defaultdict(list), defaultdict(list), defaultdict(set)
+    for c in C:
+        if c[4] == "resolved": by_t[c[3]].append(c); fwd[c[2]].add(c[3])
+        else: by_n[c[0]].append(c)
+    seen = {t[5]: 0 for t in targets}
+    found, frontier = [], [t[5] for t in targets]
+    names = {t[0] for t in targets}
+    for d in range(1, depth + 1):
+        nxt = []
+        for t in frontier:
+            for c in sorted(by_t.get(t, ()), key=lambda c: loc_key(c[1])):
+                if c[2] not in seen: seen[c[2]] = d; nxt.append(c[2]); found.append((d, c, "resolved"))
+        frontier = nxt
+    for n in sorted(names):
+        for c in sorted(by_n.get(n, ()), key=lambda c: loc_key(c[1])):
+            if c[2] not in seen: seen[c[2]] = 1; found.append((1, c, "name-only"))
+    for _, c, _ in found: files.add(split_loc(c[1])[0])
+    tests = {split_loc(c[1])[0] for _, c, _ in found if is_test(c[1])}
+    for f in sorted(files):
+        if not is_test(f): tests |= set(file_tests(f)[0])
+    callee, front = {t[5] for t in targets}, [t[5] for t in targets]
+    for _ in range(depth):
+        front = [y for t in front for y in fwd.get(t, ()) if y not in callee]; callee |= set(front)
+    reads = []
+    for r in rows("reads.tsv"):
+        if any(r[0] == t or r[0].startswith(t + ".") for t in callee):
+            own = any(r[0] == t[5] or r[0].startswith(t[5] + ".") for t in targets)
+            reads.append((r[1], r[2], r[3], r[4], "" if own else "via " + r[0]))
+    return label, found, sorted(files), sorted(tests), sorted(set(reads))
+
+def q_impact(x, depth=3):
+    d = impact_data(x, depth)
+    if d is None: return f"none: no symbol or file {x!r}\n"
+    label, found, files, tests, reads = d
+    nr = sum(1 for f in found if f[2] == "resolved")
+    out = [f"# impact of {label}",
+           f"callers (depth <= {depth}): {nr} resolved, {len(found) - nr} name-only (marked ?, not expanded)"]
+    out += [f"  d{dd}{'?' if st != 'resolved' else ' '} {c[2]}  {c[1]}" for dd, c, st in sorted(found, key=lambda f: (f[0], f[2] != "resolved", loc_key(f[1][1])))]
+    out.append(f"files ({len(files)}): " + " ".join(files))
+    py = [t for t in tests if t.endswith(".py")]; js = [t for t in tests if not t.endswith(".py")]
+    out.append(f"tests to run ({len(tests)}):")
+    if py: out.append("  python3 -m pytest " + " ".join(py))
+    if js: out.append("  js/ts: " + " ".join(js))
+    if not tests: out.append("  none found")
+    out.append(f"reads ({len(reads)}):")
+    for kind, key, loc, cfg, via in reads:
+        out.append(f"  {kind} {key}  {loc}" + (f" -> {cfg}" if cfg else "") + (f"  ({via})" if via else ""))
+    return "\n".join(out) + "\n"
+
+# ---------------------------------------------------------------- MCP server (stdio, newline-delimited JSON-RPC 2.0)
+
+MCP_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+def _s(desc, **kw): return {"type": "string", "minLength": 1, "description": desc, **kw}
+def _i(desc, lo, hi, dflt): return {"type": "integer", "minimum": lo, "maximum": hi, "default": dflt, "description": desc}
+def _tool(name, title, desc, props, req):
+    return {"name": name, "title": title, "description": desc,
+            "inputSchema": {"type": "object", "properties": props, "required": req, "additionalProperties": False},
+            "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}}
+SYM = "Symbol: bare name, Class.method, dotted Python path (pkg.mod.func) or path#name for JS/TS."
+MCP_TOOLS = [
+    _tool("where", "Find definitions", "Definition sites (file:line, kind, signature, first doc line) of a symbol, config key or environment variable.",
+          {"name": _s(SYM + " Also a TOML/JSON key or an env var name.")}, ["name"]),
+    _tool("find", "Search symbol names", "Symbols whose name contains a substring (case-insensitive).",
+          {"word": _s("Substring of the symbol name."), "limit": _i("Maximum rows.", 1, 500, 60)}, ["word"]),
+    _tool("callers", "Call sites", "Call sites of a symbol. Each row is resolved (target known from imports, aliases, self/super) or name-only (same name, target unknown).",
+          {"name": _s(SYM), "resolved_only": {"type": "boolean", "default": False, "description": "Drop name-only rows."},
+           "limit": _i("Maximum rows.", 1, 500, 60)}, ["name"]),
+    _tool("tests", "Tests for a file", "Tests that import or mention a source file, directly and through one import hop; for a symbol, the tests that call it.",
+          {"path": _s("Repo-relative file path, or a symbol.")}, ["path"]),
+    _tool("map", "Code map", "CODEMAP lines (path | LOC | purpose | key symbols | tests) for files under a path prefix.",
+          {"prefix": {"type": "string", "default": "", "description": "Path prefix; empty for the whole repo."}}, []),
+    _tool("context", "Context pack", "One compact pack for a symbol or file within a character budget: definition, signature, docstring, body, callers with their line, callees, covering tests and the last 3 commits. Use it instead of grep + reading whole files.",
+          {"target": _s(SYM + " Or a repo-relative file path."), "budget": _i("Maximum characters of output.", 200, 50000, 4000)}, ["target"]),
+    _tool("impact", "Change impact", "What may break if a symbol or file changes: transitive callers, the test files to run (with a pytest command) and the env vars and config keys it reads.",
+          {"target": _s(SYM + " Or a repo-relative file path."), "depth": _i("Caller depth.", 1, 6, 3)}, ["target"]),
+]
+MCP_CALL = {"where": lambda a: q_where(a["name"]), "find": lambda a: q_find(a["word"], a.get("limit", 60)),
+            "callers": lambda a: q_callers(a["name"], a.get("resolved_only", False), a.get("limit", 60)),
+            "tests": lambda a: q_tests(a["path"]), "map": lambda a: q_map(a.get("prefix", "")),
+            "context": lambda a: q_context(a["target"], a.get("budget", 4000)), "impact": lambda a: q_impact(a["target"], a.get("depth", 3))}
+
+def check_args(schema, a):
+    if not isinstance(a, dict): return "arguments must be an object"
+    props = schema["properties"]
+    for k in a:
+        if k not in props: return f"unknown argument: {k}"
+    for k in schema["required"]:
+        if k not in a: return f"missing required argument: {k}"
+    for k, v in a.items():
+        p = props[k]; t = p["type"]
+        if t == "string" and (not isinstance(v, str) or len(v) < p.get("minLength", 0)): return f"{k} must be a non-empty string"
+        if t == "boolean" and not isinstance(v, bool): return f"{k} must be a boolean"
+        if t == "integer" and (not isinstance(v, int) or isinstance(v, bool) or not p["minimum"] <= v <= p["maximum"]):
+            return f"{k} must be an integer in [{p['minimum']}, {p['maximum']}]"
+    return None
+
+def mcp():
+    out = sys.stdout.buffer; sys.stdout = sys.stderr          # stdout carries only JSON-RPC messages
+    last = [0.0]
+    def send(msg): out.write(json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n"); out.flush()
+    def err(i, code, m): return {"jsonrpc": "2.0", "id": i, "error": {"code": code, "message": m}}
+    def handle(msg):
+        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+            return err(msg.get("id") if isinstance(msg, dict) else None, -32600, "invalid request")
+        i, meth, prm = msg.get("id"), msg["method"], msg.get("params") or {}
+        if "id" not in msg: return None                      # notifications (initialized, cancelled) need no reply
+        ok = lambda res: {"jsonrpc": "2.0", "id": i, "result": res}
+        if meth == "initialize":
+            v = prm.get("protocolVersion")
+            return ok({"protocolVersion": v if v in MCP_VERSIONS else MCP_VERSIONS[0],
+                       "capabilities": {"tools": {"listChanged": False}},
+                       "serverInfo": {"name": "codeindex", "title": "codeindex", "version": VERSION},
+                       "instructions": "Code navigation for this git repository. Prefer context (one pack per symbol) and impact "
+                                       "over grep plus reading whole files. Rows marked name-only are unverified matches."})
+        if meth == "ping": return ok({})
+        if meth == "tools/list": return ok({"tools": MCP_TOOLS})
+        if meth == "tools/call":
+            name, a = prm.get("name"), prm.get("arguments") or {}
+            tool = next((t for t in MCP_TOOLS if t["name"] == name), None)
+            if tool is None: return err(i, -32602, f"unknown tool: {name}")
+            bad = check_args(tool["inputSchema"], a)
+            if bad: return ok({"content": [{"type": "text", "text": bad}], "isError": True})
+            if os.environ.get("CODEINDEX_MCP_NOBUILD") != "1" and time.time() - last[0] > 2:
+                try: build(quiet=True)
+                except Exception as e: print(f"codeindex: refresh failed: {e}", file=sys.stderr)
+                last[0] = time.time()
+            try: text = MCP_CALL[name](a); bad = False
+            except NoIndex: text, bad = "no index: run `codeindex build`", True
+            except Exception as e: text, bad = f"{type(e).__name__}: {e}", True
+            return ok({"content": [{"type": "text", "text": text}], "isError": bad})
+        return err(i, -32601, f"method not found: {meth}")
+    for raw in sys.stdin.buffer:
+        if not raw.strip(): continue
+        try: msg = json.loads(raw)
+        except ValueError: send(err(None, -32700, "parse error")); continue
+        if isinstance(msg, list):
+            res = [r for r in map(handle, msg) if r is not None]
+            if res: send(res)
+        else:
+            r = handle(msg)
+            if r is not None: send(r)
+
+# ---------------------------------------------------------------- CLI
 
 def main():
     a = sys.argv[1:]
-    if not a or a[0] in ("-h", "--help"): print(__doc__); return
-    c = a[0]; x = a[1] if len(a) > 1 else ""
-    if c == "build": build()
-    elif c == "where": grep_tsv("symbols.tsv", x, 3 if "." in x else 0)  # cols: name kind file:line qualified doc
-    elif c == "find": grep_tsv("symbols.tsv", x, 0, exact=False)
-    elif c == "callers": grep_tsv("callers.tsv", x, 0)
-    elif c == "tests":
-        x = x.removeprefix("./")
-        p = os.path.join(IDX, "testmap.tsv"); hit = False
-        for ln in open(p):
-            s, t, i = ln.rstrip("\n").split("\t")
-            if s == x or s.endswith("/" + x): print(f"{s} direct: {t or '-'}\n{s} indirect(1 hop, importers' tests): {i or '-'}"); hit = True
-        ar = os.path.join(IDX, "areas.tsv")
-        if os.path.exists(ar):
-            for ln in open(ar):
-                n, src, ts = ln.rstrip("\n").split("\t")
-                if any(fnmatch.fnmatch(x, g) for g in src.split()): print(f"area {n}: {ts}"); hit = True
-        if not hit: print("none (try: codeindex callers <symbol>, or grep -l the module name in tests/)")
-    elif c == "map":
-        for ln in open(os.path.join(IDX, "CODEMAP.md")):
-            if not x or ln.startswith(x): print(ln.rstrip())
-    else: print(__doc__)
+    if not a or a[0] in ("-h", "--help", "help"): print(__doc__); return
+    c, pos, opt = a[0], [], {}
+    it = iter(a[1:])
+    for x in it:
+        if x in ("--budget", "--depth", "--limit"):
+            v = next(it, "")
+            if not v.isdigit(): sys.exit(f"{x} needs a number")
+            opt[x[2:]] = int(v)
+        elif x in ("--resolved", "--full"): opt[x[2:]] = True
+        else: pos.append(x)
+    arg = pos[0] if pos else ""
+    need = {"where", "find", "callers", "tests", "changed", "context", "impact"}
+    if c in need and not arg: sys.exit(f"usage: codeindex {c} <{'sha' if c == 'changed' else 'name'}>")
+    try:
+        if c == "build": build(full=opt.get("full", False))
+        elif c == "mcp": mcp()
+        elif c == "where": print(q_where(arg, opt.get("limit", 60)), end="")
+        elif c == "find": print(q_find(arg, opt.get("limit", 60)), end="")
+        elif c == "callers": print(q_callers(arg, opt.get("resolved", False), opt.get("limit", 60)), end="")
+        elif c == "tests": print(q_tests(arg), end="")
+        elif c == "map": print(q_map(arg), end="")
+        elif c == "changed": print(q_changed(arg), end="")
+        elif c == "dead": print(q_dead(opt.get("limit", 50)), end="")
+        elif c == "context": print(q_context(arg, opt.get("budget", 4000)), end="")
+        elif c == "impact": print(q_impact(arg, opt.get("depth", 3)), end="")
+        else: print(__doc__); sys.exit(2)
+    except NoIndex:
+        sys.exit("no index: run `codeindex build`")
 
 if __name__ == "__main__": main()
