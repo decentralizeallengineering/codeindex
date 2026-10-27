@@ -1,5 +1,7 @@
 # codeindex
 
+[![tests](https://github.com/decentralizeallengineering/codeindex/actions/workflows/tests.yml/badge.svg)](https://github.com/decentralizeallengineering/codeindex/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+
 A token-free code navigation index for a git repository. It answers "where is this defined", "who calls it" and
 "which tests cover this file" from a small on-disk index, so a person or a coding agent does not need to grep or read
 whole files. Python is parsed with `ast`, JavaScript with regular expressions. No network, no models, standard library only.
