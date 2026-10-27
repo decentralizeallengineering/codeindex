@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""codeindex: token-free code navigation index for a git repo. build | where | callers | tests | map | find.
+  codeindex build            index the repo (Python via ast, JS via regex); also writes CODEMAP.md at the repo root
+  codeindex where NAME       definition of a symbol (NAME or Class.method): file:line
+  codeindex find WORD        symbols whose name contains WORD
+  codeindex callers NAME     call sites of NAME
+  codeindex tests PATH       tests that import or mention a source file (direct, plus one import hop)
+  codeindex map [PREFIX]     the CODEMAP lines for files under PREFIX
+The index lives in <repo>/.index/ (add it to .gitignore). $CODEINDEX_ROOT overrides the repo root; inside a linked
+worktree without its own index the main checkout's index is used. Optional tests/AREAS.toml maps source globs to tests.
+If the graphify tool is on PATH a code graph is refreshed after a build (CODEINDEX_NO_GRAPH=1 skips it, CODEINDEX_WAIT=1
+blocks until it is done)."""
+import ast, os, re, subprocess, sys, tomllib, fnmatch, shutil, time
+from collections import defaultdict
+
+def root():
+    r = os.environ.get("CODEINDEX_ROOT")
+    if r: return r
+    try:
+        top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return os.getcwd()
+    if not os.path.isdir(os.path.join(top, ".index")):
+        # Linked worktree: fall back to the main checkout's index.
+        try:
+            common = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, stderr=subprocess.DEVNULL).strip()
+            main = os.path.dirname(common)
+            if os.path.isdir(os.path.join(main, ".index")):
+                return main
+        except Exception:
+            pass
+    return top
+
+R = root(); IDX = os.path.join(R, ".index")
+
+def files():
+    out = subprocess.check_output(["git", "-C", R, "ls-files", "-co", "--exclude-standard"], text=True)
+    return [f for f in out.splitlines() if os.path.exists(os.path.join(R, f))]
+
+def doc1(d):
+    if not d: return ""
+    for ln in d.strip().splitlines():
+        if ln.strip(): return ln.strip()[:110]
+    return ""
+
+JS_FN = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function|[A-Za-z_$][\w$]*\s*=>)")
+
+def parse_file(f, p):
+    sym, calls, imps = [], [], set()
+    if f.endswith(".py"):
+        try:
+            src = open(p, encoding="utf-8", errors="replace").read()
+            tree = ast.parse(src)
+        except Exception:
+            return [], [], set(), ("", [], 0)
+        top = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                for a in n.names: imps.add(a.name)
+            elif isinstance(n, ast.ImportFrom):
+                if n.level:
+                    pk = f.split("/")[:-1]
+                    pk = pk[:len(pk) - (n.level - 1)] if n.level > 1 else pk
+                    m = ".".join(pk + ([n.module] if n.module else []))
+                else: m = n.module or ""
+                imps.add(m)
+                for a in n.names: imps.add(m + "." + a.name)
+        def visit(node, scope):
+            for c in ast.iter_child_nodes(node):
+                if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    kind = "class" if isinstance(c, ast.ClassDef) else "def"
+                    q = (scope + "." if scope else "") + c.name
+                    sym.append((c.name, q, kind, f, c.lineno, doc1(ast.get_docstring(c))))
+                    if not scope: top.append(c.name)
+                    visit(c, q)
+                else:
+                    if isinstance(c, ast.Call):
+                        fn = c.func
+                        nm = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
+                        if nm: calls.append((nm, f, c.lineno, scope or "<module>"))
+                    visit(c, scope)
+        visit(tree, "")
+        return sym, calls, imps, (doc1(ast.get_docstring(tree)), top, len(src.splitlines()))
+    if f.endswith((".js", ".mjs")) and "vendor" not in f and ".min." not in f:
+        try: lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
+        except Exception: return [], [], set(), None
+        top = []
+        for i, ln in enumerate(lines, 1):
+            m = JS_FN.match(ln)
+            if m:
+                nm = m.group(1) or m.group(2); sym.append((nm, nm, "js", f, i, "")); top.append(nm)
+        return sym, calls, imps, ("", top, len(lines))
+    return [], [], set(), None
+
+def build():
+    t0 = time.time()
+    fl = files()
+    sym, calls, imps, mods = [], [], defaultdict(set), {}
+    import pickle, hashlib
+    cp = os.path.join(IDX, "cache.pkl")
+    try: cache = pickle.load(open(cp, "rb"))
+    except Exception: cache = {}
+    ncache = {}; redone = 0
+    for f in fl:
+        p = os.path.join(R, f)
+        try: st = os.stat(p); key = (st.st_mtime_ns, st.st_size)
+        except OSError: continue
+        ent = cache.get(f)
+        if ent and ent[0] == key:
+            ncache[f] = ent
+            _, fsym, fcalls, fimps, fmod = ent
+        else:
+            redone += 1
+            fsym, fcalls, fimps, fmod = parse_file(f, p)
+            ncache[f] = (key, fsym, fcalls, fimps, fmod)
+        sym += fsym; calls += fcalls
+        if fimps: imps[f] |= fimps
+        if fmod is not None: mods[f] = fmod
+    try:
+        os.makedirs(IDX, exist_ok=True); pickle.dump(ncache, open(cp, "wb"))
+    except Exception: pass
+    # tests map
+    tests = [f for f in mods if f.startswith("tests/") and f.endswith(".py")]
+    srcs = [f for f in mods if not f.startswith("tests/") and f.endswith(".py")]
+    def dotted(f):
+        d = f[:-3].replace("/", ".")
+        return d[:-9] if d.endswith(".__init__") else d
+    tmap = defaultdict(set)
+    texts = {}
+    for t in tests:
+        try: texts[t] = open(os.path.join(R, t), encoding="utf-8", errors="replace").read()
+        except Exception: texts[t] = ""
+    for s in srcs:
+        d = dotted(s); base = os.path.basename(s)
+        for t in tests:
+            im = imps[t]
+            hit = any(i == d or i.startswith(d + ".") or i.lstrip(".") == d for i in im) \
+                or (s in texts[t]) or ("'" + d + "'" in texts[t]) or ('"' + d + '"' in texts[t])
+            if not hit:  # "from pkg import mod" style
+                pk, _, leaf = d.rpartition(".")
+                hit = bool(pk) and (pk + "." + leaf) in im
+            if hit: tmap[s].add(t)
+    # indirect: tests of src modules that import s (1 hop)
+    ind = defaultdict(set)
+    for s in srcs:
+        d = dotted(s)
+        for o in srcs:
+            if o != s and any(i == d or i.startswith(d + ".") for i in imps[o]):
+                ind[s] |= tmap.get(o, set())
+        ind[s] -= tmap.get(s, set())
+    # area fallback from tests/AREAS.toml if present
+    areas = []
+    ap = os.path.join(R, "tests/AREAS.toml")
+    if os.path.exists(ap):
+        try: areas = tomllib.load(open(ap, "rb")).get("area", [])
+        except Exception: pass
+    os.makedirs(IDX, exist_ok=True)
+    w = lambda n, rows: open(os.path.join(IDX, n), "w").write("".join("\t".join(map(str, r)) + "\n" for r in rows))
+    w("symbols.tsv", sorted((s[0], s[2], f"{s[3]}:{s[4]}", s[1], s[5]) for s in sym))
+    w("callers.tsv", sorted((c[0], f"{c[1]}:{c[2]}", c[3]) for c in calls))
+    w("testmap.tsv", [(s, " ".join(sorted(tmap.get(s, ()))), " ".join(sorted(ind[s]))) for s in sorted(set(tmap) | {k for k in ind if ind[k]})])
+    area_rows = []
+    for a in areas:
+        area_rows.append((a.get("name", ""), " ".join(a.get("src", [])), " ".join(a.get("tests", []))))
+    w("areas.tsv", area_rows)
+    # CODEMAP.md
+    out = ["# CODEMAP (generated by codeindex; do not edit). Format: path | LOC | purpose | key symbols | tests",
+           "Query: codeindex where X | callers X | tests PATH | map DIR | find WORD", ""]
+    for f in sorted(mods):
+        if f.startswith("tests/"): continue
+        d, top, n = mods[f]
+        tt = sorted(tmap.get(f, []))
+        tshow = ",".join(os.path.basename(x) for x in tt[:3]) + (f"+{len(tt)-3}" if len(tt) > 3 else "")
+        out.append(f"{f} | {n} | {d} | {' '.join(top[:8])}{'...' if len(top) > 8 else ''} | {tshow}")
+    out.append("\n## tests (dir: count)")
+    cnt = defaultdict(int)
+    for t in tests: cnt[os.path.dirname(t)] += 1
+    out += [f"{k}: {v}" for k, v in sorted(cnt.items())]
+    cm = "\n".join(out) + "\n"
+    open(os.path.join(IDX, "CODEMAP.md"), "w").write(cm)
+    open(os.path.join(R, "CODEMAP.md"), "w").write(cm)
+    open(os.path.join(IDX, "stamp"), "w").write(subprocess.run(["git", "-C", R, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip() + " " + time.strftime("%F %T") + "\n")
+    print(f"codeindex: {len(mods)} files ({redone} reparsed) {len(sym)} symbols {len(calls)} calls {len(tmap)} src->tests in {time.time()-t0:.1f}s")
+    # graphify graph (AST only, no LLM): only when sources changed; background unless CODEINDEX_WAIT=1
+    if shutil.which("graphify") and os.environ.get("CODEINDEX_NO_GRAPH") != "1":
+        h = hashlib.md5("".join(f"{f}{ncache[f][0]}" for f in sorted(ncache) if f.endswith((".py", ".js", ".ts", ".sh"))).encode()).hexdigest()
+        sp = os.path.join(IDX, "graphsig")
+        old = open(sp).read().strip() if os.path.exists(sp) else ""
+        if old == h and os.path.exists(os.path.join(R, "graphify-out/graph.json")):
+            print("graphify: unchanged, skipped")
+        else:
+            wait = os.environ.get("CODEINDEX_WAIT") == "1"
+            cmd = f"flock {'' if wait else '-n '}{IDX}/graph.lock graphify update {R} >/dev/null 2>&1 && echo {h} > {sp}"
+            if wait:
+                t1 = time.time(); subprocess.run(["sh", "-c", cmd], timeout=600)
+                print(f"graphify: rebuilt in {time.time()-t1:.1f}s")
+            else:
+                subprocess.Popen(["nice", "-n", "19", "sh", "-c", cmd], start_new_session=True)
+                print("graphify: refreshing in background (set CODEINDEX_WAIT=1 to block)")
+
+def grep_tsv(name, pat, col=0, exact=True, limit=60):
+    p = os.path.join(IDX, name)
+    if not os.path.exists(p): sys.exit("no index: run `codeindex build`")
+    n = 0
+    for ln in open(p):
+        c = ln.rstrip("\n").split("\t")
+        v = c[col]
+        if (v == pat) if exact else (pat in v):
+            print(ln.rstrip("\n").replace("\t", "  ")); n += 1
+            if n >= limit: print(f"... capped at {limit}"); break
+    if not n: print("none")
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"): print(__doc__); return
+    c = a[0]; x = a[1] if len(a) > 1 else ""
+    if c == "build": build()
+    elif c == "where": grep_tsv("symbols.tsv", x, 3 if "." in x else 0)  # cols: name kind file:line qualified doc
+    elif c == "find": grep_tsv("symbols.tsv", x, 0, exact=False)
+    elif c == "callers": grep_tsv("callers.tsv", x, 0)
+    elif c == "tests":
+        x = x.removeprefix("./")
+        p = os.path.join(IDX, "testmap.tsv"); hit = False
+        for ln in open(p):
+            s, t, i = ln.rstrip("\n").split("\t")
+            if s == x or s.endswith("/" + x): print(f"{s} direct: {t or '-'}\n{s} indirect(1 hop, importers' tests): {i or '-'}"); hit = True
+        ar = os.path.join(IDX, "areas.tsv")
+        if os.path.exists(ar):
+            for ln in open(ar):
+                n, src, ts = ln.rstrip("\n").split("\t")
+                if any(fnmatch.fnmatch(x, g) for g in src.split()): print(f"area {n}: {ts}"); hit = True
+        if not hit: print("none (try: codeindex callers <symbol>, or grep -l the module name in tests/)")
+    elif c == "map":
+        for ln in open(os.path.join(IDX, "CODEMAP.md")):
+            if not x or ln.startswith(x): print(ln.rstrip())
+    else: print(__doc__)
+
+if __name__ == "__main__": main()
