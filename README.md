@@ -13,6 +13,18 @@ need to grep and read whole files. One script, standard library only, no network
 - **Callers are marked** `resolved` (target known) or `name-only` (same name, target unknown), so you know how much
   to trust each row.
 
+## Try it
+
+```console
+$ git clone https://github.com/decentralizeallengineering/codeindex && cd codeindex
+$ ./codeindex build
+codeindex: 4 files (4 reparsed) 223 symbols 1799 calls (64% resolved) 2 src->tests in 0.05s
+$ ./codeindex find build
+codeindex:1124  def  codeindex.build(full=False, quiet=False)  Incremental: unchanged blob hashes and FORMAT -> nothing to do; ...
+codeindex:1622  env  CODEINDEX_MCP_NOBUILD  (read in codeindex.mcp.handle)
+tests/test_codeindex.py:109  def  tests.test_codeindex.test_build_where_callers_tests(tmp_path)
+```
+
 ## Install
 
     cp codeindex ~/.local/bin/ && chmod +x ~/.local/bin/codeindex
