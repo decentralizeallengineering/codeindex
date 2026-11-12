@@ -2,6 +2,31 @@
 
 [![tests](https://github.com/decentralizeallengineering/codeindex/actions/workflows/tests.yml/badge.svg)](https://github.com/decentralizeallengineering/codeindex/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 
+codeindex tells you or your coding agent where a symbol is defined, who calls it and which tests cover it, from a local index with no model and no network.
+
+## Install
+
+    git clone --depth 1 https://github.com/decentralizeallengineering/codeindex && install -D -m 755 codeindex/codeindex ~/.local/bin/codeindex
+
+As a Claude Code plugin (skill plus MCP server):
+
+    claude plugin marketplace add decentralizeallengineering/decentralizeallengineering && claude plugin install codeindex@decentralizeallengineering
+
+## Example
+
+```console
+$ cd codeindex
+$ codeindex build
+codeindex: 5 files (5 reparsed) 234 symbols 1799 calls (64% resolved) 2 src->tests in 0.06s
+$ codeindex find build
+codeindex:1124  def  codeindex.build(full=False, quiet=False)  Incremental: unchanged blob hashes and FORMAT -> nothing to do; otherwise re-parse the changed files only,
+codeindex:1622  env  CODEINDEX_MCP_NOBUILD  (read in codeindex.mcp.handle)
+tests/test_codeindex.py:109  def  tests.test_codeindex.test_build_where_callers_tests(tmp_path)
+tests/test_codeindex.py:261  def  tests.test_codeindex.test_format_version_change_forces_full_rebuild(tmp_path)
+```
+
+## How it works
+
 A token-free code navigation index for a git repository. It answers "where is this defined", "who calls it", "which
 tests cover it" and "what breaks if I change it" from a small on-disk index, so a person or a coding agent does not
 need to grep and read whole files. One script, standard library only, no network, no models. Python 3.11 or newer.
@@ -13,21 +38,7 @@ need to grep and read whole files. One script, standard library only, no network
 - **Callers are marked** `resolved` (target known) or `name-only` (same name, target unknown), so you know how much
   to trust each row.
 
-## Try it
-
-```console
-$ git clone https://github.com/decentralizeallengineering/codeindex && cd codeindex
-$ ./codeindex build
-codeindex: 4 files (4 reparsed) 223 symbols 1799 calls (64% resolved) 2 src->tests in 0.05s
-$ ./codeindex find build
-codeindex:1124  def  codeindex.build(full=False, quiet=False)  Incremental: unchanged blob hashes and FORMAT -> nothing to do; ...
-codeindex:1622  env  CODEINDEX_MCP_NOBUILD  (read in codeindex.mcp.handle)
-tests/test_codeindex.py:109  def  tests.test_codeindex.test_build_where_callers_tests(tmp_path)
-```
-
-## Install
-
-    cp codeindex ~/.local/bin/ && chmod +x ~/.local/bin/codeindex
+## Setup
 
 Add `.index/` to the repository's `.gitignore`. `build` also writes `CODEMAP.md` at the repo root; commit it or
 ignore it.

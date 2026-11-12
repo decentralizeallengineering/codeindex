@@ -1,0 +1,11 @@
+{
+  "name": "codeindex",
+  "version": "0.2.0",
+  "description": "Local code index for coding agents: where it is defined, who calls it, which tests cover it. Skill plus MCP server.",
+  "author": {"name": "decentralizeallengineering"},
+  "homepage": "https://github.com/decentralizeallengineering/codeindex",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "codeindex": {"command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/codeindex", "mcp"]}
+  }
+}
