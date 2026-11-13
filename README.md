@@ -218,3 +218,9 @@ rebuild, the context budget, impact, and an MCP round trip. They run in about 8 
 ## License
 
 Apache-2.0, see `LICENSE` and `NOTICE`.
+
+## Related
+
+- [zoomout](https://github.com/decentralizeallengineering/zoomout): step back when an agent is stuck; installs from the same plugin marketplace
+- [donegate](https://github.com/decentralizeallengineering/donegate): Stop hook: no "done" without a test run after the last edit
+- [all tools](https://github.com/decentralizeallengineering): the index of this account
